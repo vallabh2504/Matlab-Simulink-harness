@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "matlab-engineering-harness"
+version = "0.3.0"
+description = "Evidence-gated MATLAB and Simulink engineering workflows for AI coding agents"
+readme = "README.md"
+authors = [{name = "S V V Sai Sri Vallabh Pataneni"}]
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/vallabh2504/Matlab-Simulink-harness"
+Issues = "https://github.com/vallabh2504/Matlab-Simulink-harness/issues"
+
+[project.scripts]
+matlab-harness = "matlab_harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+matlab_harness = ["resources/**/*"]

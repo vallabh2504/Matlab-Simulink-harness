@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+results/
+*.slxc
+slprj/
+*.asv
+*.slx.autosave
+.env
+.env.*
+!.env.example
+.pytest_cache/
