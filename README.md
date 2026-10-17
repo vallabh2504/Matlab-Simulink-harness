@@ -51,14 +51,12 @@ A project moves through five checkpoints. Each one has to be accepted before the
 next one starts.
 
 ```mermaid
-stateDiagram-v2
-    direction LR
-    [*] --> Requirements
-    Requirements --> Architecture: you approve, reviewer accepts
-    Architecture --> Implementation: reviewer accepts the design
-    Implementation --> Verification: checks pass, reviewer accepts
-    Verification --> Handoff: checks pass, reviewer accepts
-    Handoff --> [*]: final gate passes
+flowchart TD
+    req["1. Requirements"] -- "you approve,<br/>reviewer accepts" --> arch["2. Architecture"]
+    arch -- "reviewer accepts<br/>the design" --> impl["3. Implementation"]
+    impl -- "checks pass,<br/>reviewer accepts" --> ver["4. Verification"]
+    ver -- "checks pass,<br/>reviewer accepts" --> hand["5. Handoff"]
+    hand -- "final gate passes" --> done(["Project complete"])
 ```
 
 Inside every checkpoint, the same loop runs. The harness is the coordinator: it gives
