@@ -18,3 +18,5 @@ Orchestrator: import the independent report with `matlab-harness review`, assess
 On repair: assign limited owned change, rerun relevant independent/regression checks and obtain current closure. On interruption: inspect `resume`, active leases, current hashes, actual artifacts and explicit stale-lock recovery. Preserve previous baseline when revising and keep approvals separate from proposals. Native runtime spawning owns parallelism; the policy does not invent MCP subagent APIs or privileges.
 
 Outputs: evidence-backed review, calibrated finding/closure records, honest independence/capability level, bounded repair status and portable continuation sufficient without private chat transcripts.
+
+Short cards with runnable snippets, inlined into task packets: [verification](../cards/verification.md).

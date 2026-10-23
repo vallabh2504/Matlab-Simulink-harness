@@ -57,8 +57,44 @@ session/model identity; independence is an attestation, not authenticated by the
 
 Findings use the schema in [review standards](standards/review.md). Empty findings
 are allowed only when the reviewer actually inspected the relevant content.
-Import with `review requirements review.json --owner ...`, then `accept requirements`.
+Save raw replies inside the current packet's scratch directory, using its returned
+path, and pass a project-relative path when importing. Use a fresh answer file for
+each packet. Rewriting a protected project support file invalidates its snapshot.
+Import with `review requirements <scratch-relative-review.json> --owner ...`, then `accept requirements`.
 Repeat architecture, lease src to an actual worker, implement and finish the task.
+The complete-record example above is for the document checkpoints. For an executed
+checkpoint in a new project, also supply the matching `packet_id`, independent
+checks and host execution receipts. Prefer the simpler packet answer interface:
+`answer <scratch-relative-review-answer.json> --owner <owner> --reviewer-session <observed-session>
+--model <observed-model> --packet <packet-id>`; it pins bookkeeping to the packet.
+
+Set up the tests once, after architecture is accepted and before the first
+`run-check`. The check plans, probe runners and semantic plan are all part of the
+reviewed snapshot, so changing any of them after a check has run makes that check
+and its review stale, and the semantic plan cannot change once implementation is
+accepted. In this order:
+
+1. Write the check scripts and a known-good reference copy of each file under test
+   outside the agents' scope (for example `checks/` and `reference/`).
+2. `configure-checks implementation|verification|handoff --plan checks.json --owner <owner>`.
+3. `configure-probes --owner <owner> --plan runners.json --reason <approval-reference>`,
+   where a MATLAB runner is `[{"kind":"matlab","executable":"matlab"}]`.
+4. `configure-semantics --owner <owner> --plan semantic-plan.json --reason <source>`.
+   It names the good reference and defective variants of the promised properties;
+   see the [assurance guide](evidence-assurance.md) for plan fields and MATLAB
+   property assertion identifiers.
+
+After each builder or repair task, run the checks, and at verification and handoff
+also `run-semantics --owner <owner>`, before creating the reviewer packet. The
+reviewer writes its own script inside the packet's scratch directory. MATLAB runs it
+from that directory, so it reaches project code with
+`addpath(fullfile('..','..','..','src'))`. In a manual host, run `run-probe --owner
+<owner> --packet <packet-id> --check-id <check-id> --script <scratch-script>
+--reviewer-session <observed-session>` and copy the returned receipt `id` to that
+independent check's `receipt_id`; its check ID and artifact must match the executed
+script. Automated runtime reviewers can supply a `run` proposal instead, which the
+orchestrator executes after review.
+
 Implementation/repair leases require accepted requirements and architecture.
 Use `lease ... --kind discovery` or `--kind design` for explicitly scoped earlier
 investigation/design after requirements approval.

@@ -20,13 +20,20 @@ import re
 import secrets
 import shutil
 import subprocess
+import time
 import uuid
 
 
 PHASES = ("requirements", "architecture", "implementation", "verification", "handoff")
 ASSERTIONS = {"USER-APPROVED", "PROPOSED", "ASSUMED", "VERIFIED", "UNKNOWN"}
 SEVERITIES = {"CRITICAL", "MAJOR", "MODERATE", "MINOR"}
+SERIOUS = {"CRITICAL", "MAJOR"}  # severities that block acceptance while open
 KINDS = {"PROVEN DEFECT", "EVIDENCE GAP", "POTENTIAL DEFECT", "OPTIONAL IMPROVEMENT"}
+# Honest independence levels. A separate session of the builder's own model, or a
+# separate session the host only reports, still counts; a sequential pass by the
+# builder's own session does not.
+INDEPENDENCE = {"independent-agent", "same-model-separate-session", "host-reported", "external-human",
+                "sequential-role-pass"}
 DEFAULT_BUDGETS = {"builder": 3600, "reviewer": 1800, "repair": 3600, "native": 1800}
 # Out-of-scope files MATLAB or a check command could execute. A new one can
 # shadow a check function, because MATLAB resolves the current folder first.
@@ -36,6 +43,10 @@ UNPROTECTED_DIRECTORIES = {".git", ".matlab-harness", "__pycache__", ".pytest_ca
 UNPROTECTED_SUFFIXES = {".asv", ".slxc", ".pyc"}
 PROTECTED_COPY_LIMIT = 16 * 1024 * 1024
 TEXT_DOCUMENTS = {".md", ".txt", ".rst", ".adoc", ".tex", ".html"}
+# A check record embeds this much of each stream; the full stream stays in its raw file.
+STREAM_HEAD, STREAM_TAIL, STREAM_ERROR_LINES, STREAM_WARNING_LINES = 64 * 1024, 192 * 1024, 30, 10
+# A warning and its "> In f (line 12)" stack; "Error in f (line 12)" stays an error.
+WARNING_LINE = re.compile(r"^(Warning:|>?\s*In\b)", re.I)
 
 
 class ProjectError(ValueError):
@@ -70,26 +81,97 @@ def non_document_artifacts(snapshot):
             if fingerprint is not None and Path(name).suffix.lower() not in documents}
 
 
+def loads(text):
+    """json.loads for text a model may have written: a nesting too deep to decode is malformed
+    JSON like any other, a ValueError, never an error that escapes the caller's handling."""
+    try:
+        return json.loads(text)
+    except RecursionError as exc:
+        raise ValueError("JSON nested too deep to read") from exc
+
+
 def read_json(path: Path):
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
+        return loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise ProjectError(f"Cannot read {path.name}: {exc}") from exc
 
 
-def atomic_json(path: Path, data):
-    """Replace only this named record; interrupted temp files cannot become truth."""
+def json_bytes(data) -> bytes:
+    """The exact bytes atomic_json writes, so a seal can be computed before the write."""
+    return (json.dumps(data, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+
+
+def _replace(source: Path, target: Path, attempts=5):
+    """os.replace, retried briefly: on Windows a reader holding the target is a sharing violation."""
+    for attempt in range(attempts):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05)
+
+
+def atomic_bytes(path: Path, payload: bytes):
+    """Replace only this named file; interrupted temp files cannot become truth."""
     temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
-        with temp.open("x", encoding="utf-8", newline="\n") as handle:
-            json.dump(data, handle, indent=2, sort_keys=True, allow_nan=False)
-            handle.write("\n")
+        with temp.open("xb") as handle:
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temp, path)
+        _replace(temp, path)
+        if os.name != "nt":
+            # POSIX may lose a rename on power loss unless the folder is synced; NTFS orders it.
+            folder = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(folder)
+            finally:
+                os.close(folder)
     finally:
         if temp.exists():
             temp.unlink()
+
+
+def atomic_json(path: Path, data):
+    atomic_bytes(path, json_bytes(data))
+
+
+def bounded_stream(path: Path, relative: str):
+    """(text, bytes, truncated): the whole stream when small, else its head and tail around the
+    error lines of the omitted middle, so a digest of the record still finds them."""
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if size <= STREAM_HEAD + STREAM_TAIL:
+            # A descendant may still be writing; embed only the bytes that were measured.
+            return handle.read(size).decode("utf-8", errors="replace"), size, False
+        from .compact import NOISE, SIGNAL
+        head, end = handle.read(STREAM_HEAD), size - STREAM_TAIL
+        # Rescan the line the head cuts, so an error that straddles it is kept whole.
+        cut = head.rfind(b"\n") + 1 or STREAM_HEAD
+        head = head[:cut]
+        handle.seek(cut)
+        # Errors take the slots; warnings, which MATLAB can repeat thousands of times, get a few.
+        errors, warnings, follow = [], [], False
+        while handle.tell() < end and len(errors) < STREAM_ERROR_LINES:
+            line = handle.readline(4096).decode("utf-8", errors="replace").strip()
+            if line and (follow or (not NOISE.match(line) and SIGNAL.match(line))):
+                bucket = errors if follow or not WARNING_LINE.match(line) else warnings
+                if len(bucket) < (STREAM_ERROR_LINES if bucket is errors else STREAM_WARNING_LINES) and line not in bucket:
+                    bucket.append(line)
+            # "Error using f" is followed by its message, which is the line a repair needs.
+            follow = line.lower().startswith(("error using", "error in", "caused by"))
+        handle.seek(end)
+        tail = handle.read(STREAM_TAIL)
+    # Errors before warnings, so a digest capped at a few hundred characters still reaches them.
+    picked = errors + warnings
+    marker = (f"\n[{end - cut} bytes omitted; the full stream is {relative}. Error lines from the"
+              f" omitted part, at most {STREAM_ERROR_LINES} and {STREAM_WARNING_LINES} warnings:]\n")
+    text = (head.decode("utf-8", errors="replace") + marker + "\n".join(picked)
+            + "\n[end of omitted part]\n" + tail.decode("utf-8", errors="replace"))
+    return text, size, True
 
 
 def inside(root: Path, relative: str) -> Path:
@@ -143,7 +225,9 @@ class Project:
         inside(self.root, ".matlab-harness/project.json")
 
     @classmethod
-    def initialize(cls, root, title: str, builder: str, scope: list[str]):
+    def initialize(cls, root, title: str, builder: str, scope: list[str], proof_mode="executed"):
+        if proof_mode not in {"executed", "legacy-attested"}:
+            raise ProjectError("Unknown proof assurance mode")
         project = cls(root)
         project.root.mkdir(parents=True, exist_ok=True)
         if project.control.exists():
@@ -168,22 +252,44 @@ class Project:
                 "requirements": [], "approvals": [], "decisions": [], "tasks": {},
                 "required_checks": {}, "commands": {}, "evidence": {}, "reviews": {}, "acceptances": [],
                 "repair_budget": 10, "repairs": 0, "budgets": DEFAULT_BUDGETS.copy(),
-                "runtime": {"adapter": "manual"}}
+                "runtime": {"adapter": "manual"},
+                "proof_policy": {"version": 1, "mode": proof_mode, "runners": [],
+                                 "reason": "New project host execution policy" if proof_mode == "executed" else "Explicit legacy attestation compatibility initialization"}}
         project._write_record(data)
         return project
 
     def load(self):
-        data = read_json(self.record)
-        if not isinstance(data, dict) or data.get("schema_version") != 1:
-            raise ProjectError("Unsupported schema; preserve records and migrate explicitly")
-        key = self._seal_key(data.get("id"))
-        if key is not None:
-            seal = self.control / "project.seal"
-            if not seal.is_file() or not hmac.compare_digest(
-                    seal.read_text(encoding="utf-8").strip(),
-                    hmac.new(key, self.record.read_bytes(), "sha256").hexdigest()):
-                raise ProjectError("Project record changed outside a harness transaction; preserve it and inspect the change")
-        return data
+        """Read-only: the record is parsed and sealed from one read of its bytes. A commit in
+        progress can leave the new record sealed only by seal.next, which is accepted; a mismatch
+        is retried briefly before it is called tamper, since a writer may be mid-commit."""
+        for attempt in range(4):
+            if attempt:
+                time.sleep(0.05)
+            try:
+                raw = self.record.read_bytes()
+                data = loads(raw.decode("utf-8-sig"))
+            except (OSError, ValueError) as exc:
+                if attempt < 3:
+                    continue
+                raise ProjectError(f"Cannot read {self.record.name}: {exc}") from exc
+            if not isinstance(data, dict) or data.get("schema_version") != 1:
+                raise ProjectError("Unsupported schema; preserve records and migrate explicitly")
+            key = self._seal_key(data.get("id"))
+            if key is None or self._sealed(key, raw):
+                return data
+        raise ProjectError("Project record changed outside a harness transaction; preserve it and inspect the change")
+
+    def _sealed(self, key, raw):
+        """The seal, or a pending seal.next, that matches exactly these record bytes. seal.next is
+        read first: a promotion renames it onto seal, so a reader cannot miss both."""
+        expected = hmac.new(key, raw, "sha256").hexdigest()
+        for name in ("project.seal.next", "project.seal"):
+            try:
+                if hmac.compare_digest((self.control / name).read_text(encoding="utf-8").strip(), expected):
+                    return self.control / name
+            except OSError:
+                continue
+        return None
 
     def _seal_key(self, identifier, create=False):
         if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{32}", identifier):
@@ -201,13 +307,46 @@ class Project:
         return key
 
     def _write_record(self, data):
-        atomic_json(self.record, data)
+        payload = json_bytes(data)
         key = self._seal_key(data.get("id"), create=True)
-        if key is not None:
-            seal = self.control / "project.seal"
-            temp = seal.with_name(seal.name + "." + uuid.uuid4().hex + ".tmp")
-            temp.write_text(hmac.new(key, self.record.read_bytes(), "sha256").hexdigest() + "\n", encoding="utf-8")
-            os.replace(temp, seal)
+        if key is None:
+            atomic_bytes(self.record, payload)
+            return
+        # Seal first, then the record, then promote the seal: a crash at any point leaves a record
+        # that one of the two seals matches.
+        pending = self.control / "project.seal.next"
+        atomic_bytes(pending, (hmac.new(key, payload, "sha256").hexdigest() + "\n").encode("utf-8"))
+        try:
+            atomic_bytes(self.record, payload)
+        except BaseException:
+            # The record was not written: a seal for bytes reported as failed must not stay valid.
+            try:
+                pending.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        try:
+            self._finalise_seal()
+        except OSError:
+            # The commit is on disk and seal.next matches it; the next transaction promotes it.
+            # Raising here would make the caller repeat a mutation that already happened.
+            pass
+
+    def _finalise_seal(self):
+        """Under the lock: promote a seal.next that matches the record; drop one that does not
+        (a commit that crashed before writing its record)."""
+        pending = self.control / "project.seal.next"
+        if not pending.is_file():
+            return
+        key = self._seal_key(read_json(self.record).get("id"))
+        if key is not None and self._sealed(key, self.record.read_bytes()) == pending:
+            _replace(pending, self.control / "project.seal")
+        else:
+            try:
+                pending.unlink()
+            except OSError:
+                # A stale seal.next is harmless: the next commit overwrites it before its record.
+                pass
 
     def record_seal(self):
         data = read_json(self.record)
@@ -222,10 +361,15 @@ class Project:
             with lock.open("x", encoding="utf-8") as handle:
                 json.dump({"token": token, "pid": os.getpid(), "created": now()}, handle)
         except FileExistsError as exc:
-            raise ProjectError("Mutation lock exists. Inspect it; explicit recover-lock needs its token") from exc
+            unfinished = "; ".join(f"{c['name']} (pid {c['pid']}, {c['started']})" for c in self.unfinished_checks()[:3])
+            raise ProjectError("Mutation lock exists. Inspect it; explicit recover-lock needs its token"
+                               + ("; a check it ran may still be running: " + unfinished if unfinished else "")) from exc
         failed = False
         try:
             data = self.load()
+            # A crash after the last commit wrote its record leaves it sealed only by seal.next;
+            # promote it now, or this commit's own seal.next would strand the record.
+            self._finalise_seal()
             if owner is not None and data["owner"] != owner:
                 raise ProjectError("Only the claimed orchestrator may mutate this project")
             yield data
@@ -256,6 +400,23 @@ class Project:
         # first verify the old process has stopped. Preserve the full lock record.
         atomic_json(inside(self.root, ".matlab-harness/history/recovered-lock-" + uuid.uuid4().hex + ".json"), data)
         lock.unlink()
+        # A check process outlives a killed harness; its pid is only in its STARTED record.
+        return {"recovered": True, "unfinished_checks": self.unfinished_checks()}
+
+    def unfinished_checks(self):
+        """Checks with a STARTED record and no terminal evidence: their process may still run."""
+        found = []
+        for started in sorted((self.control / "evidence").glob("*-started.json")):
+            if (started.parent / (started.name[:-len("-started.json")] + ".json")).exists():
+                continue
+            try:
+                record = read_json(started)
+            except (OSError, ValueError, ProjectError):
+                record = {}
+            record = record if isinstance(record, dict) else {}
+            found.append({"name": record.get("name"), "pid": record.get("pid"),
+                          "started": started.relative_to(self.root).as_posix()})
+        return found
 
     def claim(self, owner: str):
         if not owner.strip():
@@ -332,6 +493,9 @@ class Project:
                 files[relative] = None
         snapshot = {"requirements": self.requirements_digest(data), "artifacts": files,
                     "checks": data["required_checks"], "commands": data["commands"], "scope": data["scope"]}
+        for policy in ("proof_policy", "semantic_plan"):
+            if policy in data:
+                snapshot[policy] = data[policy]
         if "support_baseline" in data:
             # Check scripts and other out-of-scope files are part of the evidence.
             # New files are handled when a role ends (enforce_support), not here.
@@ -445,6 +609,12 @@ class Project:
                     or not isinstance(v, dict) or v.get("adapter", runtime["adapter"]) not in
                     {"manual", "agy", "command"} for k, v in roles.items()):
                 raise ProjectError("Runtime roles must map builder/reviewer/repair to adapter configuration objects")
+            from .capabilities import capabilities, role_config
+            try:
+                for role in ("builder", "reviewer", "repair"):
+                    capabilities(role_config(runtime, role))
+            except ValueError as exc:
+                raise ProjectError(str(exc)) from exc
         with self.transaction(owner) as data:
             if repair_budget is not None and repair_budget < data["repairs"]:
                 raise ProjectError("Repair budget cannot erase already consumed repairs")
@@ -545,8 +715,8 @@ class Project:
                         from .runtime import _stop_owned_process
                         _stop_owned_process(process)
                     raise
-            stdout=inside(self.root,raw['stdout']).read_text(encoding='utf-8',errors='replace')
-            stderr=inside(self.root,raw['stderr']).read_text(encoding='utf-8',errors='replace')
+            stdout,out_bytes,out_cut=bounded_stream(inside(self.root,raw['stdout']),raw['stdout'])
+            stderr,err_bytes,err_cut=bounded_stream(inside(self.root,raw['stderr']),raw['stderr'])
             if diagnostic:stderr+=('\n' if stderr else '')+diagnostic
             after = self.snapshot(data)
             if before != after:
@@ -557,7 +727,8 @@ class Project:
                         "stdout": stdout, "stderr": stderr, "snapshot": after,
                         "pid":process.pid if process is not None else None,"cleanup":cleanup,
                         "raw_output":{stream:{'path':relative,'sha256':digest(inside(self.root,relative))}
-                                      for stream,relative in raw.items()}}
+                                      for stream,relative in raw.items()},
+                        "output_bytes":{'stdout':out_bytes,'stderr':err_bytes},"truncated":out_cut or err_cut}
             relative = ".matlab-harness/evidence/" + identifier + ".json"
             atomic_json(inside(self.root, relative), evidence)
             data["evidence"][name] = {"path": relative, "sha256": digest(inside(self.root, relative))}
@@ -571,7 +742,31 @@ class Project:
         if checkpoint not in PHASES:
             raise ProjectError("Unknown checkpoint")
         report_file = inside(self.root, report_path)
-        report = read_json(report_file)
+        from .decoding import decode_file
+        decoded = decode_file(report_file, "complete-review-record", document=True)
+        if decoded.problems:
+            from .ingestion import record_gap
+            data = self.load()
+            handoff = {"checkpoint": checkpoint, "snapshot_digest": value_digest(self.snapshot(data))}
+            gap_id = record_gap(self, owner, handoff, decoded)
+            # Bind recoverable serious claims only when the full-record source
+            # identifies an independent reviewer; unknown identity stays a gap.
+            branches = decoded.answer.get("answer_sources", [decoded.answer]) if isinstance(decoded.answer, dict) else []
+            sessions = {v.get("reviewer_session") for v in branches if isinstance(v, dict)}
+            contributors = {data["builder_session"], *data.get("contributors", [])}
+            if len(sessions) == 1 and None not in sessions and not sessions & contributors:
+                from .answer import translate
+                scratch = self.control / "scratch" / ("raw-" + uuid.uuid4().hex)
+                scratch.mkdir(parents=True, exist_ok=True)
+                record, _ = translate(self, data, checkpoint, decoded.answer, scratch)
+                record.update(checkpoint=checkpoint, reviewer_session=next(iter(sessions)),
+                              model="untrusted-full-record", independence="host-reported",
+                              snapshot_digest=handoff["snapshot_digest"])
+                retained = ".matlab-harness/ingestion/" + uuid.uuid4().hex + ".json"
+                atomic_json(self.root / retained, record)
+                self.record_review_protocol_failure(owner, checkpoint, retained, "Ambiguous raw record " + gap_id)
+            raise ReviewProtocolError("Unread review source " + gap_id + ": " + "; ".join(decoded.problems))
+        report = decoded.answer
         required = {"reviewer_session", "model", "independence", "checkpoint", "verdict", "findings", "snapshot_digest"}
         if not isinstance(report, dict) or not required <= report.keys() or report["checkpoint"] != checkpoint:
             raise ReviewProtocolError("Incomplete review record or wrong checkpoint")
@@ -579,7 +774,7 @@ class Project:
             raise ProjectError("Review metadata must be nonempty strings")
         if report["verdict"] not in {"ACCEPT", "REJECT", "INCOMPLETE"}:
             raise ReviewProtocolError("Invalid review verdict")
-        if any(not isinstance(report[k], str) or not report[k].strip() for k in ("model", "reviewer_session")) or report["independence"] not in {"independent-agent", "external-human", "sequential-role-pass"}:
+        if any(not isinstance(report[k], str) or not report[k].strip() for k in ("model", "reviewer_session")) or report["independence"] not in INDEPENDENCE:
             raise ProjectError("Reviewer identity and honest independence level required")
         findings = report["findings"]
         if not isinstance(findings, list):
@@ -598,6 +793,10 @@ class Project:
                 raise ReviewProtocolError("Invalid finding status")
             if any(not isinstance(finding[k], str) or not finding[k].strip() for k in fields - {"id"}):
                 raise ReviewProtocolError("Finding values must be nonempty strings")
+        from .probes import review_problems
+        proof_problems = review_problems(self, report)
+        if proof_problems:
+            raise ReviewProtocolError("; ".join(proof_problems))
         with self.transaction(owner) as data:
             contributors = {data["builder_session"], *data.get("contributors", []),
                             *(t["worker"] for t in data["tasks"].values())}
@@ -608,7 +807,7 @@ class Project:
             defects = self._seed_defects(data)
             current_findings = {f["id"]: f for f in findings}
             for finding in findings:
-                previous_item = defects.get(checkpoint + ":" + finding["id"])
+                previous_item = defects.get(self.due(checkpoint, finding, defects) + ":" + finding["id"])
                 if previous_item:
                     if finding["artifact"] != previous_item["origin"]["artifact"]:
                         raise ReviewProtocolError("Finding ID must retain its exact original artifact string; put additional repair locations in evidence/closure: " + finding["id"])
@@ -637,7 +836,7 @@ class Project:
                     raise ReviewProtocolError("Unknown, duplicate or wrong-checkpoint protocol allegation disposition")
                 if disposition["status"] == "TRACKED":
                     finding = current_findings.get(disposition["finding_id"])
-                    if not finding or finding["severity"] not in {"CRITICAL", "MAJOR"} or finding["status"] == "CLOSED":
+                    if not finding or finding["severity"] not in SERIOUS or finding["status"] == "CLOSED":
                         raise ReviewProtocolError("TRACKED allegation must reference an unresolved serious finding in this report")
                 elif disposition["status"] != "CLOSED":
                     raise ReviewProtocolError("Protocol allegation disposition status must be CLOSED or TRACKED")
@@ -658,22 +857,68 @@ class Project:
                         run["review_import"] = {"status": "IMPORTED", "report": report_path,
                             "sha256": digest(report_file), "archive": archived,
                             "archive_sha256": digest(inside(self.root, archived))}
+            filed = {}
             for finding in findings:
-                key = checkpoint + ":" + finding["id"]
-                item = defects.setdefault(key, {"checkpoint": checkpoint, "history": [], "blocking": False,
-                                                "origin": finding, "origin_digest": value_digest(finding)})
+                due = self.due(checkpoint, finding, defects)
+                key = due + ":" + finding["id"]
+                item = defects.setdefault(key, {"checkpoint": due, "history": [], "blocking": False,
+                                                "origin": finding, "origin_digest": value_digest(finding),
+                                                **({"raised_at": checkpoint} if due != checkpoint else {})})
                 item["history"].append({"finding": finding, "review": archived,
                                          "review_sha256": digest(inside(self.root, archived)), "recorded": now()})
-                item["blocking"] = (item["blocking"] or finding["severity"] in {"CRITICAL", "MAJOR"}) and finding["status"] != "CLOSED"
+                item["blocking"] = (item["blocking"] or finding["severity"] in SERIOUS) and finding["status"] != "CLOSED"
                 item["finding"] = finding
+                if due != checkpoint and item["blocking"]:
+                    from .answer import claim_digest
+                    filed[(due, claim_digest(finding))] = finding["id"]
+            for key, item in pending.items():
+                # A deferred allegation this report files again, open and serious, is now that
+                # durable finding; one item answers both at the checkpoint they are due.
+                if key not in resolved and item["checkpoint"] != checkpoint:
+                    from .answer import claim_digest, normalize_finding
+                    tracked = filed.get((item["checkpoint"], claim_digest(normalize_finding(item["finding"])[0])))
+                    if tracked:
+                        resolved[key] = {"finding_digest": key, "status": "TRACKED", "finding_id": tracked,
+                                         "evidence": "filed again in " + archived,
+                                         "closure": "Tracked as open finding " + tracked}
             for key, disposition in resolved.items():
                 data["pending_review_findings"][key].update(status="RESOLVED", disposition=disposition,
                     resolution_review=archived, resolution_sha256=digest(inside(self.root, archived)))
 
-    def record_review_protocol_failure(self, owner, checkpoint, report_path, reason):
-        """Retain rejected reports and serious allegations without declaring them true."""
+    def record_review_protocol_failure(self, owner, checkpoint, report_path, reason, kind="protocol"):
+        """Retain rejected reports and serious allegations without declaring them true.
+
+        kind "unfinished" is a structured report from a reviewer attempt that then failed
+        in transport; its allegations bind the same way but it is not a protocol attempt.
+        Identical findings left by several reports stay separate keys here; the reviewer
+        packet shows them as one open item (answer.open_items).
+        """
         report_file = inside(self.root, report_path)
-        report = read_json(report_file)
+        from .decoding import decode_document
+        decoded = decode_document(report_file.read_bytes(), "complete-review-record")
+        if decoded.problems:
+            from .ingestion import record_gap
+            data = self.load()
+            handoff = {"checkpoint": checkpoint, "snapshot_digest": value_digest(self.snapshot(data))}
+            gap_id = record_gap(self, owner, handoff, decoded)
+            # Bind recoverable serious claims only when the full-record source
+            # identifies an independent reviewer; unknown identity stays a gap.
+            branches = decoded.answer.get("answer_sources", [decoded.answer]) if isinstance(decoded.answer, dict) else []
+            sessions = {v.get("reviewer_session") for v in branches if isinstance(v, dict)}
+            contributors = {data["builder_session"], *data.get("contributors", [])}
+            if len(sessions) == 1 and None not in sessions and not sessions & contributors:
+                from .answer import translate
+                scratch = self.control / "scratch" / ("raw-" + uuid.uuid4().hex)
+                scratch.mkdir(parents=True, exist_ok=True)
+                record, _ = translate(self, data, checkpoint, decoded.answer, scratch)
+                record.update(checkpoint=checkpoint, reviewer_session=next(iter(sessions)),
+                              model="untrusted-full-record", independence="host-reported",
+                              snapshot_digest=handoff["snapshot_digest"])
+                retained = ".matlab-harness/ingestion/" + uuid.uuid4().hex + ".json"
+                atomic_json(self.root / retained, record)
+                self.record_review_protocol_failure(owner, checkpoint, retained, "Ambiguous raw record " + gap_id)
+            raise ReviewProtocolError("Unread review source " + gap_id + ": " + "; ".join(decoded.problems))
+        report = decoded.answer
         fingerprint = digest(report_file)
         with self.transaction(owner) as data:
             current = value_digest(self.snapshot(data))
@@ -688,7 +933,7 @@ class Project:
                     raise ProjectError("Rejected review report changed")
                 return
             failures[report_path] = {"checkpoint": checkpoint, "snapshot_digest": current,
-                "path": report_path, "sha256": fingerprint, "reason": reason, "recorded": now()}
+                "path": report_path, "sha256": fingerprint, "reason": reason, "kind": kind, "recorded": now()}
             for run in data.get("runs", []):
                 if (run["role"] == "reviewer" and run["checkpoint"] == checkpoint
                         and "review_import" in run):
@@ -697,17 +942,15 @@ class Project:
                         run["review_import"] = {"status": "REJECTED_PROTOCOL", "report": report_path,
                             "sha256": fingerprint}
             pending = data.setdefault("pending_review_findings", {})
-            fields = {"id", "severity", "kind", "artifact", "evidence", "impact", "repair", "closure", "status"}
             findings = report.get("findings", [])
             for index, finding in enumerate(findings if isinstance(findings, list) else []):
-                if (not isinstance(finding, dict) or not fields <= finding.keys()
-                        or any(not isinstance(finding[k], str) or not finding[k].strip() for k in fields)
-                        or finding["severity"] not in {"CRITICAL", "MAJOR"}
-                        or finding["kind"] not in KINDS
-                        or finding["status"] not in {"OPEN", "DISPUTED", "ACCEPTED-RISK"}):
+                # Every serious claim not closed binds, however incomplete (answer.translate fills
+                # missing text). A restated open item (answers) is already on record.
+                if (not isinstance(finding, dict) or finding.get("answers")
+                        or finding.get("severity") not in SERIOUS or finding.get("status") == "CLOSED"):
                     continue
                 key = value_digest({"report_sha256": fingerprint, "index": index, "finding": finding})
-                pending[key] = {"checkpoint": checkpoint, "snapshot_digest": current,
+                pending[key] = {"checkpoint": self.due(checkpoint, finding, data.get("defects", {})), "snapshot_digest": current,
                     "source_report": report_path, "source_sha256": fingerprint,
                     "finding": finding, "status": "OPEN", "classification": "UNIMPORTED_ALLEGATION"}
 
@@ -764,7 +1007,7 @@ class Project:
                 defects[checkpoint + ":" + finding["id"]] = {
                     "checkpoint": checkpoint, "finding": finding,
                     "origin": finding, "origin_digest": value_digest(finding),
-                    "blocking": finding["severity"] in {"CRITICAL", "MAJOR"} and finding["status"] != "CLOSED",
+                    "blocking": finding["severity"] in SERIOUS and finding["status"] != "CLOSED",
                     "history": [{"finding": finding, "review": entry["path"],
                                  "review_sha256": entry["sha256"], "recorded": entry["recorded"]}]}
         data["defects"] = defects
@@ -772,6 +1015,61 @@ class Project:
             data["decisions"].append({"assertion": "VERIFIED", "text": "Durable defect history restored from archived current reviews",
                                       "source": "compatible record migration", "at": now()})
         return defects
+
+    def reserved_location(self, location):
+        """What a finding location names that no builder may change: "control" for the harness's
+        own records (reviewer packets excepted), "contract" for requirements.md, or None. A
+        location that starts with a reserved path is reserved, whatever annotation follows it:
+        "requirements.md:15 (SL-4)". Of several locations, a control record dominates, and the
+        contract counts only when every location names it: a builder can act on the rest. A
+        fragment that names no file ("tables at :35-42") annotates a location; it is not one."""
+        kinds = {self._reserved_one(item) or ("file" if re.match(r"\s*[`'\"]?[\w./\\-]+\.[A-Za-z]\w*", item) else None)
+                 for item in re.split(r"[;\n]", location) if item.strip()} - {None}
+        return "control" if "control" in kinds else "contract" if kinds == {"contract"} else None
+
+    def _reserved_one(self, location):
+        lead = location.strip().replace("`", "").strip("'\"").strip().replace("\\", "/")
+        lead = lead[2:] if lead.startswith("./") else lead
+        root = self.root.as_posix().rstrip("/") + "/"
+        if os.name == "nt":
+            lead, root = lead.casefold(), root.casefold()
+        lead = lead[len(root):] if lead.startswith(root) else lead
+        if not lead.startswith(".matlab-harness/packets/"):
+            if lead.startswith(".matlab-harness/"):
+                return "control"
+            if re.match(r"requirements\.md(?:$|[:#\s(,\[])", lead):
+                return "contract"
+        location = re.sub(r":\d+(?::\d+)?$", "", location.strip().replace("`", "")).replace("\\", "/")
+        candidate = Path(location)
+        actual = (candidate if candidate.is_absolute() else self.root / candidate).resolve().as_posix()
+        root = self.root.as_posix().rstrip("/")
+        if os.name == "nt":
+            actual, root = actual.casefold(), root.casefold()
+        if actual.startswith(root + "/.matlab-harness/") and not actual.startswith(root + "/.matlab-harness/packets/"):
+            return "control"
+        return "contract" if actual == root + "/requirements.md" else None
+
+    def due(self, checkpoint, finding, defects):
+        """The checkpoint that must answer a finding. A finding already stored under this
+        checkpoint stays there, as recorded. A new question on the approved contract raised at
+        requirements is answered by the design, which picks a reading or shows none fits, so it
+        is due at architecture; every other finding is due where it was raised."""
+        if (checkpoint == "requirements" and checkpoint + ":" + str(finding.get("id")) not in defects
+                and self.reserved_location(str(finding.get("artifact", ""))) == "contract"):
+            return "architecture"
+        return checkpoint
+
+    def user_questions(self, data):
+        """IDs of the contract findings the design says no reading of requirements.md answers,
+        written "USER QUESTION <ID>:" in a scoped document."""
+        return {m.casefold() for m in re.findall(r"USER QUESTION\s+([^\s:]+)\s*:", self._scoped_text(data), re.I)}
+
+    def _scoped_text(self, data):
+        text = ""
+        for name, fingerprint in self.snapshot(data)["artifacts"].items():
+            if fingerprint is not None and Path(name).suffix.lower() in TEXT_DOCUMENTS:
+                text += (self.root / name).read_text(encoding="utf-8", errors="replace") + "\n"
+        return text
 
     def _approval_current(self, data):
         if not data["approvals"] or data["approvals"][-1]["digest"] != self.requirements_digest(data):
@@ -791,7 +1089,12 @@ class Project:
             self._approval_current(data)
         except ProjectError as exc:
             problems.append(str(exc))
+        from .ingestion import open_gaps
+        for gap_id in open_gaps(data, checkpoint):
+            problems.append("Unread review source requires reconciled correction: " + gap_id)
         current = self.snapshot(data)
+        from .semantics import problems as semantic_problems
+        problems.extend(semantic_problems(self, data, checkpoint))
         if checkpoint in {"implementation", "verification", "handoff"}:
             if any(value is None for value in current["artifacts"].values()):
                 problems.append("A declared engineering artifact is absent, or a scoped directory has no files")
@@ -825,6 +1128,8 @@ class Project:
                 problems.append("Review record missing or tampered")
             else:
                 report = read_json(path)
+                from .probes import review_problems
+                problems.extend(review_problems(self, report))
                 if review["snapshot"] != current:
                     problems.append("Review is stale")
                 if report["verdict"] != "ACCEPT":
@@ -832,7 +1137,9 @@ class Project:
                 if report["independence"] == "sequential-role-pass":
                     problems.append("Sequential self-review does not satisfy independent acceptance")
                 for finding in report["findings"]:
-                    if finding["severity"] in {"CRITICAL", "MAJOR"} and finding["status"] != "CLOSED":
+                    # One due later blocks there, as its durable defect.
+                    if (finding["severity"] in SERIOUS and finding["status"] != "CLOSED"
+                            and self.due(checkpoint, finding, data["defects"]) == checkpoint):
                         problems.append(f"Unresolved blocking finding: {finding['id']}")
                 runtime = data.get("runtime", {"adapter": "manual"})
                 reviewer_adapter = runtime.get("roles", {}).get("reviewer", {}).get("adapter", runtime.get("adapter", "manual"))
@@ -849,6 +1156,8 @@ class Project:
         unfinished_imports = self.unfinished_review_imports(data)
         if unfinished_imports:
             problems.append("Interrupted review import requires inspection")
+        if any(p.get("status") == "STARTED" for p in data.get("probe_receipts", {}).values()):
+            problems.append("Interrupted probe execution requires inspection")
         boundaries = self.unrestored_stage_boundaries(data)
         if boundaries:
             problems.append("Unrestored engineering changes from document/design execution")
@@ -869,7 +1178,9 @@ class Project:
                 problems.append("Unresolved durable blocking finding: " + key)
             else:
                 deferred.append(key)
+        from .probes import proof_mode
         return {"checkpoint": checkpoint, "accepted": not problems, "problems": problems,
+                "proof_assurance": proof_mode(data),
                 "deferred_blocking_findings": deferred,
                 "stage_boundary_violations": boundaries,
                 "unfinished_review_imports": unfinished_imports,
@@ -883,10 +1194,7 @@ class Project:
 
     def handoff_obligations(self, data):
         """Content the handoff must carry, checked from the scoped documents themselves."""
-        text = ""
-        for name, fingerprint in self.snapshot(data)["artifacts"].items():
-            if fingerprint is not None and Path(name).suffix.lower() in TEXT_DOCUMENTS:
-                text += (self.root / name).read_text(encoding="utf-8", errors="replace") + "\n"
+        text = self._scoped_text(data)
         missing = [r["id"] for r in data["requirements"] if not cites(text, r["id"])]
         problems = []
         if missing:
@@ -898,6 +1206,9 @@ class Project:
                 continue
             if item["finding"]["status"] == "OPEN" and not cites(text, item["finding"]["id"]):
                 problems.append("open reviewer finding " + key + " is not dispositioned by ID in a scoped document")
+            elif item.get("raised_at") and not cites(text, item["finding"]["id"]):
+                problems.append("contract question " + key + " is not answered by ID in a scoped document: "
+                                "say which reading of requirements.md the deliverable takes")
         return problems
 
     def accept(self, owner, checkpoint):

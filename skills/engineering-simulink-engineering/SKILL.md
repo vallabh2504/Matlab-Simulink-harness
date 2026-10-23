@@ -25,3 +25,5 @@ For Stateflow, follow the thermostat procedure in the model standard only after 
 Outputs: editable saved model/build script, parameter/interface/solver records, compiled inspection, independent scenario results, visual architecture review and regression closure. Visual model-editor QA and optional toolbox checks need their own evidence.
 
 For every native update, compile or simulation, use engineering.withRuntime around the full owned operation, including model cleanup. Load the canonical helper path first. Never leave .slxc, slprj or code generation in the caller workspace; saved models belong in explicit project outputs. See [runtime file policy](../../docs/runtime-files.md).
+
+Short cards with runnable snippets, inlined into task packets: [simulink-construction](../cards/simulink-construction.md).

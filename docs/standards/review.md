@@ -22,6 +22,15 @@ After a rejection, record a repair reason and assign a bounded change, rerun rel
 
 Requirements and architecture can have empty executable plans when their independent review is the meaningful declared obligation. Implementation, verification and handoff need nonempty executed checks. Reassess actual authorization and counterevidence: an already authorized synthetic exercise does not require a new permission request for every analyst-selected tutorial constant. Those constants remain ASSUMED. Record unresolved consequential uncertainty as a gap, without turning a formatting preference or unexecuted hypothesis into a proven fabrication.
 
+New projects additionally require packet/checkpoint/session-bound host probe receipts
+for independent PASS/closure. Complete review records must explicitly name their
+`packet_id`; packet answers imported through `answer` supply this bookkeeping
+automatically. Verification/handoff require an approved semantic adequacy plan
+or an explicit operator-approved non-applicability rationale. See
+[evidence assurance](../evidence-assurance.md) for execution, calibration and legacy
+attestation rules. An older example without receipts does not satisfy executed
+assurance merely because its JSON parses.
+
 ## Portable continuation record
 
 `resume` reports requirements/approvals, decisions with assertion status and sources, current artifact hashes, active ownership, pending phase, current failed/stale gate and next action. A different runtime must inspect source and this record before continuing. Keep important equations/parameters/interfaces in project files, not only chat. Do not embed private transcripts, provider secrets or sole-source hidden caches. A sequential role pass may aid diagnosis but is marked honestly and cannot satisfy an independent-agent acceptance gate.

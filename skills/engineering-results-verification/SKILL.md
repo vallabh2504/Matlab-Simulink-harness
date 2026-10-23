@@ -21,3 +21,5 @@ If the approved contract requires a returned artifact ledger, check actual final
 file coverage, destination resolution, digests and duplicate aliases.
 Declare manifest self-exclusion explicitly and calibrate it. Ledger requirements
 are prospective; never impose them retroactively on an accepted older contract.
+
+Short cards with runnable snippets, inlined into task packets: [verification](../cards/verification.md), [plotting](../cards/plotting.md).

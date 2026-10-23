@@ -16,3 +16,5 @@ Worked exercises: [solveHeat1D](../../examples/engineering-core/solveHeat1D.m), 
 Debugging method: isolate the failing parameter/initial state; reproduce from clean inputs; compare units/signs/residual/invariants; inspect executed code rather than cached workspace; repair the cause in the owned function; rerun relevant independent and protected regression cases. A failed result must remain visible in evidence. Never fabricate a passing MATLAB response.
 
 Outputs: readable source, explicit interfaces/units, analyzer disposition, raw numerical results, independent checks and rationale for solver/tolerance/convergence. A style improvement without changed engineering evidence is not a numerical repair.
+
+Short cards with runnable snippets, inlined into task packets: [matlab-numerics](../cards/matlab-numerics.md), [matlab-unittest](../cards/matlab-unittest.md), [matlab-errors](../cards/matlab-errors.md).

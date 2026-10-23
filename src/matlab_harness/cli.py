@@ -10,7 +10,7 @@ import sys
 from .bridge import preflight
 from .project import PHASES, Project, ProjectError, read_json, value_digest
 from .skills import catalog, install, select
-from .workflow import execute, next_step, packet, start
+from .workflow import execute, next_step, packet, start, submit_answer
 
 
 def parser():
@@ -44,6 +44,8 @@ def parser():
     journey.add_argument("--ceiling", type=float, default=14400)
     journey.add_argument("--review-existing-implementation", action="store_true")
     journey.add_argument("--stop-after", choices=PHASES)
+    mcp = commands.add_parser("mcp", help="Serve this project's tools to an agent host over stdio (MCP)")
+    mcp.add_argument("--owner", required=True)
     journey_recovery = commands.add_parser("recover-journey", help="Recover an inspected interrupted invocation without inferring successful execution")
     journey_recovery.add_argument("--owner", required=True)
     journey_recovery.add_argument("--attempt", required=True)
@@ -51,7 +53,8 @@ def parser():
     journey_recovery.add_argument("--source", required=True)
     journey_recovery.add_argument("--lock-token")
     for name in ("claim", "release", "approve", "requirement", "decision", "configure-checks", "lease",
-                 "finish-task", "run-check", "review", "accept", "repair", "revise", "configure-runtime"):
+                 "finish-task", "run-check", "review", "answer", "accept", "repair", "revise", "configure-runtime",
+                 "mutation"):
         sub = commands.add_parser(name)
         sub.add_argument("--owner", required=True)
         if name == "approve":
@@ -87,11 +90,43 @@ def parser():
             sub.add_argument("--config", help="Project-relative runtime JSON; per-role models/adapters under roles")
         elif name == "review":
             sub.add_argument("checkpoint", choices=PHASES)
-            sub.add_argument("report", help="Project-relative independent review JSON")
+            sub.add_argument("report", help="Project-relative complete review record, attested by the operator")
+        elif name == "answer":
+            sub.add_argument("report", help="Project-relative reviewer answer to a reviewer packet")
+            sub.add_argument("--reviewer-session", required=True, help="Reviewer session ID as the host reports it")
+            sub.add_argument("--model", required=True, help="Reviewer model name as the host reports it")
+            sub.add_argument("--packet", help="Reviewer packet ID; default is the newest for this checkpoint")
         elif name == "accept":
             sub.add_argument("checkpoint", choices=PHASES)
+        elif name == "mutation":
+            sub.add_argument("--seconds", type=float, help="Time limit; default is the native check budget")
         elif name in {"repair", "revise"}:
             sub.add_argument("--reason", required=True)
+    reconcile = commands.add_parser("authorize-correction", help="Authorize a complete correction after inspecting an unread source")
+    for field in ("owner", "gap", "source-sha256", "packet", "reason"):
+        reconcile.add_argument("--" + field, required=True)
+    probes = commands.add_parser("configure-probes", help="Approve executables for independent host-run probe scripts")
+    probes.add_argument("--owner", required=True)
+    probes.add_argument("--plan", required=True, help="Project JSON list of {kind,executable}")
+    probes.add_argument("--reason", required=True)
+    probe = commands.add_parser("run-probe", help="Execute a reviewer scratch script and issue a bound receipt")
+    for field in ("owner", "packet", "check-id", "script", "reviewer-session"):
+        probe.add_argument("--" + field, required=True)
+    probe.add_argument("--runner",type=int,default=0)
+    probe.add_argument("--arguments",nargs="*",default=[])
+    probe.add_argument("--inputs",nargs="*",default=[])
+    probe.add_argument("--timeout",type=float)
+    semantic = commands.add_parser("configure-semantics", help="Approve required named-defect calibration obligations")
+    for field in ("owner","plan","reason"):
+        semantic.add_argument("--"+field,required=True)
+    semantic_run=commands.add_parser("run-semantics", help="Run required semantic adequacy checks in isolated copies")
+    semantic_run.add_argument("--owner",required=True)
+    semantic_run.add_argument("--checkpoint",choices=PHASES)
+    semantic_run.add_argument("--timeout",type=float)
+    recovery=commands.add_parser("recover-execution",help="Resolve an inspected interrupted intent without claiming a passed execution")
+    for field in ("owner","id","stopped-process-attestation","reason"):
+        recovery.add_argument("--"+field,required=True)
+    recovery.add_argument("--kind",choices=("probe","semantic"),required=True)
     gate = commands.add_parser("gate")
     gate.add_argument("checkpoint", choices=PHASES)
     commands.add_parser("resume")
@@ -132,6 +167,10 @@ def dispatch(args):
         return select(args.task, args.root) if args.task else catalog(args.root), 0
     if command == "install-skills":
         return install(args.target, args.runtime, args.root), 0
+    if command == "mcp":
+        from .mcp_server import serve
+        serve(args.project, args.owner)
+        return None, 0
     project = Project(args.project)
     if command == "next":
         return next_step(project), 0
@@ -176,8 +215,40 @@ def dispatch(args):
         return evidence, 0 if evidence["status"] == "PASSED" else 2
     elif command == "review":
         project.review(args.owner, args.checkpoint, args.report)
+    elif command == "answer":
+        from .project import inside
+        from .decoding import decode_file
+        return submit_answer(project, args.owner, decode_file(inside(project.root, args.report)),
+                             args.reviewer_session, args.model, args.packet), 0
+    elif command == "authorize-correction":
+        from .ingestion import authorize_reconciliation
+        return authorize_reconciliation(project, args.owner, args.gap, args.source_sha256, args.packet, args.reason), 0
+    elif command == "configure-probes":
+        from .project import inside
+        from .probes import configure
+        return configure(project,args.owner,read_json(inside(project.root,args.plan)),args.reason),0
+    elif command == "configure-semantics":
+        from .project import inside
+        from .semantics import configure
+        return configure(project,args.owner,read_json(inside(project.root,args.plan)),args.reason),0
+    elif command == "run-semantics":
+        from .semantics import run
+        result=run(project,args.owner,args.checkpoint,args.timeout)
+        return result,0 if result["status"]=="PASSED" else 2
+    elif command == "recover-execution":
+        from .execution import recover
+        return recover(project,args.owner,args.kind,args.id,args.stopped_process_attestation,args.reason),0
+    elif command == "run-probe":
+        from .probes import run
+        result=run(project,args.owner,args.packet,args.check_id,args.script,args.reviewer_session,args.runner,args.arguments,args.inputs,args.timeout)
+        return result,0 if result["status"]=="PASSED" else 2
     elif command == "accept":
         return project.accept(args.owner, args.checkpoint), 0
+    elif command == "mutation":
+        from .mutation import mutation_summary, run_mutation
+        data = project.load()
+        result = run_mutation(project, args.owner, data["phase"], args.seconds or data["budgets"]["native"])
+        return mutation_summary(project.load()["mutation_results"][data["phase"]]) | {"evidence": result["status"]}, 0
     elif command == "gate":
         result = project.gate(args.checkpoint)
         return result, 0 if result["accepted"] else 2
@@ -186,7 +257,7 @@ def dispatch(args):
     elif command == "revise":
         project.revise(args.owner, args.reason)
     elif command == "recover-lock":
-        project.recover_lock(args.token)
+        return project.recover_lock(args.token), 0
     elif command == "recover-owner":
         project.recover_owner(args.previous, args.owner, args.reason)
     elif command == "resume":
@@ -206,9 +277,10 @@ def main(argv=None):
     args = parser().parse_args(argv)
     try:
         result, code = dispatch(args)
-    except (ProjectError, OSError, KeyError, TypeError, subprocess.CalledProcessError) as exc:
+    except (ProjectError, OSError, KeyError, TypeError, ValueError, subprocess.CalledProcessError) as exc:
         result, code = {"status": "BLOCKED", "reason": str(exc)}, 2
-    print(json.dumps(result, indent=2, allow_nan=False))
+    if result is not None:
+        print(json.dumps(result, indent=2, allow_nan=False))
     return code
 
 

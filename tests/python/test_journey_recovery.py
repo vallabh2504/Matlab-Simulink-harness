@@ -23,7 +23,7 @@ class JourneyRecoveryTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         (self.root / "src").mkdir()
         (self.root / "src/model.m").write_text("function y=model(x),y=x;end")
-        self.project = Project.initialize(self.root, "Recovery diagnostic", "fixture-origin", ["src"])
+        self.project = Project.initialize(self.root, "Recovery diagnostic", "fixture-origin", ["src"], proof_mode="legacy-attested")
         self.project.claim("owner")
         self.project.add_requirement("owner", "R-1", "Identity", "actual fixture file probe", "synthetic test")
         self.project.approve("owner", "fixture-human", "explicit synthetic test authorization; not live approval")

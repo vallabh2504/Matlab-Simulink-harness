@@ -9,7 +9,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from matlab_harness.project import PHASES, Project
 from matlab_harness.workflow import start
-from matlab_harness.journey import _implementation_hashes, _reserved_artifact
+from matlab_harness.journey import _implementation_hashes
 
 spec = importlib.util.spec_from_file_location("engineering_journey", Path(__file__).resolve().parents[2] / "scripts/run_engineering_journey.py")
 journey = importlib.util.module_from_spec(spec)
@@ -45,13 +45,16 @@ else:
     if mode == 'corrupt-journey-lock' and stage == 'handoff':
         Path('.matlab-harness/journey.lock').write_text('[]')
     bad=(Path('engineering/model.m').read_text() == 'wrong')
+    items={}; prior=data.get('defects',{}).get('implementation:F-1',{}).get('finding',{}).get('status') == 'OPEN'
     if stage == 'implementation' and (bad or mode == 'reject'):
-        verdict='REJECT'; findings=[dict(id='F-1',severity='MAJOR',kind='PROVEN DEFECT',artifact='engineering/model.m',evidence='Actual fixture source is wrong',impact='Identity violated',repair='Restore identity',closure='Run independent identity probe',status='OPEN')]
-    elif stage == 'implementation' and 'implementation:F-1' in data.get('defects',{}):
-        findings=[{**data['defects']['implementation:F-1']['finding'],'status':'CLOSED','evidence':'Actual repaired fixture and probe agree','prior_finding_digest':data['defects']['implementation:F-1']['origin_digest']}]
+        verdict='REJECT'
+        if prior: items={'F-1':dict(status='STILL_OPEN',evidence='Actual fixture source is still wrong')}
+        else: findings=[dict(id='F-1',severity='MAJOR',kind='PROVEN DEFECT',artifact='engineering/model.m',evidence='Actual fixture source is wrong',impact='Identity violated',repair='Restore identity',closure='Run independent identity probe',status='OPEN')]
+    elif stage == 'implementation' and prior:
+        items={'F-1':dict(status='CLOSED',evidence='IC-1: actual repaired fixture and probe agree')}
     if mode == 'control-finding' and stage == 'requirements':
         verdict='REJECT'; findings=[dict(id='C-1',severity='MAJOR',kind='EVIDENCE GAP',artifact='.matlab-harness/project.json',evidence='Approval counterevidence needed',impact='Cannot attest current authorization',repair='Orchestrator must clarify source',closure='Independent reassessment',status='OPEN')]
-    response=dict(checkpoint=stage,verdict=verdict,findings=findings,snapshot_digest=value_digest(p.snapshot()),**charter(p))
+    response=dict(checkpoint=stage,verdict=verdict,findings=findings,open_items=items,snapshot_digest=value_digest(p.snapshot()),**charter(p))
 print(json.dumps(dict(status='SUCCESS',model='synthetic protocol fixture; not AI',session_id='fixture-'+role,response=response)))
 '''
 
@@ -63,7 +66,7 @@ class JourneyTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         (self.root / "engineering").mkdir()
         (self.root / "engineering/model.m").write_text("function y=model(x), y=x; end")
-        start(self.root, "Identity diagnostic", "orchestrator-builder", "owner", ["engineering"])
+        start(self.root, "Identity diagnostic", "orchestrator-builder", "owner", ["engineering"], proof_mode="legacy-attested")
         self.project = Project(self.root)
         self.project.add_requirement("owner", "ID-1", "Identity in K", "independent identity probe", "synthetic diagnostic task", "K")
         (self.root / "provider_fixture.py").write_text(FIXTURE)
@@ -138,8 +141,10 @@ class JourneyTests(unittest.TestCase):
         (self.root / "engineering/model.m").write_text("wrong")
         (self.root / "mode.txt").write_text("reviewer-mutates")
         result = journey.run_journey(self.root, "owner", 60, review_existing_implementation=True)
-        self.assertEqual(result["status"], "INPUT_REQUIRED", result)
-        self.assertIn("Reviewer modified", result["reason"])
+        # Each attempt's edit is undone, so the seeded fault survives for the implementation review.
+        self.assertEqual(result["status"], "REVIEW_PROTOCOL_EXHAUSTED", result)
+        self.assertEqual((self.root / "engineering/model.m").read_text(), "wrong")
+        self.assertEqual(sum(d.get("source") == "reviewer boundary" for d in self.project.load()["decisions"]), 3)
         self.assertEqual(self.project.load()["phase"], "architecture")
         self.assertFalse(self.project.load()["evidence"])
         self.assertEqual(len(self.project.load()["acceptances"]), 1)
@@ -168,11 +173,11 @@ class JourneyTests(unittest.TestCase):
     def test_control_artifact_location_spellings_are_recognized(self):
         for location in ("requirements.md:1", "./requirements.md", "./.matlab-harness/project.json:42:3",
                          str(self.root / "requirements.md") + ":12", ".matlab-harness\\project.json"):
-            self.assertTrue(_reserved_artifact(self.project, location), location)
+            self.assertTrue(self.project.reserved_location(location), location)
         import os
         if os.name == "nt":
-            self.assertTrue(_reserved_artifact(self.project, ".MATLAB-HARNESS/project.json"))
-        self.assertFalse(_reserved_artifact(self.project, "engineering/model.m:4"))
+            self.assertTrue(self.project.reserved_location(".MATLAB-HARNESS/project.json"))
+        self.assertFalse(self.project.reserved_location("engineering/model.m:4"))
 
     def test_unapproved_discovery_waits_and_does_not_repeat(self):
         first = journey.run_journey(self.root, "owner", 60)

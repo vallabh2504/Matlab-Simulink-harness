@@ -7,13 +7,17 @@ import json
 import math
 import os
 import re
+import subprocess
 from pathlib import Path
 import sys
 import time
 import uuid
 
-from .project import DEFAULT_BUDGETS, PHASES, Project, ProjectError, atomic_json, digest, inside, read_json, value_digest
-from .workflow import execute, next_step
+from .project import DEFAULT_BUDGETS, PHASES, SERIOUS, Project, ProjectError, atomic_json, cites, digest, inside, read_json, value_digest
+from .compact import check_summary
+from .mutation import run_mutation
+from .answer import _packet_id
+from .workflow import _clip, execute, next_step
 
 
 def _write_once(path, record):
@@ -44,19 +48,31 @@ def _implementation_changes(project, protected):
             for name in sorted(set(protected) | set(actual)) if actual.get(name) != protected.get(name)}
 
 
-def _reserved_artifact(project, location):
-    """Recognize normal relative/absolute artifact locations with optional line suffix."""
-    locations = re.split(r"[;\n]", location)
-    if len(locations) > 1:
-        return any(_reserved_artifact(project, item) for item in locations if item.strip())
-    location = re.sub(r":\d+(?::\d+)?$", "", location.strip()).replace("\\", "/")
-    candidate = Path(location)
-    candidate = (candidate if candidate.is_absolute() else project.root / candidate).resolve()
-    actual = candidate.as_posix()
-    root = project.root.as_posix().rstrip("/")
-    if os.name == "nt":
-        actual, root = actual.casefold(), root.casefold()
-    return actual == root + "/requirements.md" or actual.startswith(root + "/.matlab-harness/")
+def _for_user(project, stage, finding, asked):
+    """Whether only the user can act on a blocking finding: one on a control record; one on the
+    contract once the design says no reading answers it ("USER QUESTION <ID>:"), or at
+    requirements, which has no design to answer it; another the reviewer marks a user decision.
+    A contract finding the design has not given up on is the design's to repair."""
+    location = project.reserved_location(finding["artifact"])
+    if location == "contract":
+        return stage == "requirements" or finding["id"].casefold() in asked
+    return location == "control" or (finding.get("user_decision") is True and finding.get("kind") != "PROVEN DEFECT")
+
+
+def _gate_text(problems, checks, total=4000, each=600):
+    """Distinct gate problems for repair, without the failed checks the summary already shows."""
+    shown = {"Check not passed: " + name for name in checks}
+    kept = [p for p in dict.fromkeys(problems) if p not in shown
+            and not ("semantic-adequacy" in checks and p.startswith("Required semantic adequacy did not pass"))]
+    text, used = [], 0
+    for index, problem in enumerate(kept):
+        item = _clip(problem, each)
+        if used + len(item) > total:
+            text.append(f"(+{len(kept) - index} more in gate record)")
+            break
+        text.append(item)
+        used += len(item)
+    return ("Gate problems: " + " | ".join(text) + ".") if text else ""
 
 
 class Journey:
@@ -158,10 +174,16 @@ class Journey:
     def remaining(self):
         return max(0.0, self.declaration["ceiling_seconds"] - self.prior_seconds - (time.monotonic() - self.started))
 
+    def dispatch_floor(self, budget):
+        """Below this much remaining time a role or semantic run cannot finish; stop instead."""
+        return min(120.0, budget, 0.1 * self.declaration["ceiling_seconds"])
+
     def step(self, kind, stage, name, action, limit):
         remaining = self.remaining()
         if remaining <= 0:
             raise TimeoutError("Predeclared journey ceiling exhausted")
+        if kind in {"role", "semantic"} and remaining < self.dispatch_floor(limit):
+            raise TimeoutError("Remaining journey time below dispatch floor")
         limit = min(limit, remaining)
         number = len(self.steps)
         base = self.attempt / f"step-{number:04d}"
@@ -199,27 +221,40 @@ class Journey:
         except ProjectError:
             return False
 
-    def role(self, role, stage, detail):
+    def role(self, role, stage, detail, prior=None):
         data = self.project.load()
         active = [name for name, task in data["tasks"].items() if task["status"] == "ACTIVE"]
         if active:
             return {"status": "INPUT_REQUIRED", "reason": "Inspect existing active ownership before dispatch", "tasks": active}
+        budget = data.get("budgets", DEFAULT_BUDGETS).get(role, DEFAULT_BUDGETS[role])
+        if self.remaining() < self.dispatch_floor(budget):
+            raise TimeoutError("Remaining journey time below dispatch floor")
         leased = None
         if role != "reviewer" and self.approval_current():
             leased = "journey-" + uuid.uuid4().hex
             kind = "discovery" if stage == "requirements" else "design" if stage == "architecture" else "repair" if role == "repair" else "implementation"
             self.project.lease(self.owner, leased, leased, data["scope"],
                                [r["id"] for r in data["requirements"]], kind=kind)
-        result = self.step("role", stage, role,
-            lambda limit: execute(self.project, self.owner, role, stage, detail, remaining_seconds=limit),
-            data.get("budgets", DEFAULT_BUDGETS).get(role, DEFAULT_BUDGETS[role]))
+        try:
+            result = self.step("role", stage, role,
+                lambda limit: execute(self.project, self.owner, role, stage, detail, remaining_seconds=limit,
+                                      prior=prior), budget)
+        except (ProjectError, OSError, TimeoutError):
+            # Nothing is still running; an interrupted role may be, so KeyboardInterrupt keeps the lease.
+            if leased:
+                try:
+                    self.project.finish_task(self.owner, leased, "FAILED")
+                except (ProjectError, OSError) as release:
+                    # The dispatch error is the one to report; the lease stays ACTIVE for inspection.
+                    self.steps.append({"kind": "lease-release", "name": leased, "status": "FAILED", "error": str(release)})
+            raise
         if leased and result["status"] not in {"TIMED_OUT", "INTERRUPTED"}:
             self.project.finish_task(self.owner, leased, "DONE" if result["status"] == "SUCCEEDED" else "FAILED")
         if result["status"] == "MANUAL_HANDOFF":
             return {**result, "status": "INPUT_REQUIRED", "reason": "Configured role requires native/manual execution"}
         return result
 
-    def review(self, stage):
+    def review(self, stage, checked=None):
         """Retry only rejected report protocol, never a negative verdict or trust failure.
 
         Three total attempts per unchanged checkpoint snapshot, counted from the
@@ -235,6 +270,10 @@ class Journey:
             for item in failures:
                 if digest(inside(self.project.root, item["path"])) != item["sha256"]:
                     raise ProjectError("Rejected review report changed")
+            # A transport-unfinished report binds its allegations but is not a protocol attempt.
+            # The store sorts keys, so order by time: failures[-1] must be the newest report.
+            failures = sorted((item for item in failures if item.get("kind", "protocol") == "protocol"),
+                              key=lambda item: item.get("recorded", ""))
             for run in data.get("runs", []):
                 if "packet" not in run and "review_import" not in run:
                     # Historical records predate durable import intents.
@@ -251,15 +290,62 @@ class Journey:
             if len(failures) >= 3:
                 return {"status": "REVIEW_PROTOCOL_EXHAUSTED", "reason": "Three independent review reports failed protocol for the unchanged checkpoint; inspect the retained records",
                         "attempts": len(failures), "last_failure": failures[-1]}
-            detail = "Inspect the actual current artifacts and declared check evidence. Require explicit closure of each previous blocking finding. Do not modify artifacts."
+            detail = "Inspect the actual current artifacts and declared check evidence. Answer every open item by its handle. Do not modify artifacts."
+            if checked and checked.get("status") == "FAILED":
+                failed = [name for name, row in check_summary(checked)["checks"].items() if row["status"] != "PASSED"]
+                detail += (" ACCEPT is impossible until the declared checks pass; failed: " + ", ".join(failed)
+                           + " (output under Latest check results). Diagnose the cause and file it as a finding:"
+                           " an implementation defect, an over-asserting test (one that rejects contract-compliant"
+                           " behaviour), or a contract gap only the user can resolve (set user_decision).")
+            prior = None
             if failures:
+                # A correction pass: the artifacts are unchanged, so fix the report, not the review.
                 previous = failures[-1]
-                detail += (" The prior review was NOT imported because its report failed protocol: " + previous["reason"]
-                           + ". Read the retained report " + previous["path"]
-                           + ". Reinspect the unchanged artifacts and return your own corrected report. Preserve exact prior finding identities; independently retain or revise the verdict/findings from evidence. Do not assume closure or acceptance.")
-            result = self.role("reviewer", stage, detail)
+                prior = {"report": previous["path"], "packet": _packet_id(previous["path"])}
+                # The instructions come before the reason, so a clipped task loses only the reason's tail.
+                detail += (" Your previous report " + previous["path"] + " was refused. It is copied to your scratch"
+                           " directory as prior-report.json, and its scratch files under prior-probes/. Copy it, fix"
+                           " only the points below, and resubmit the complete report. Re-propose each probe you rely"
+                           " on (run: its path in your scratch) so the host executes it for this packet; a copied"
+                           " probe that is not re-proposed proves nothing. Re-inspect only what the fix needs. Do not"
+                           " drop findings, and do not assume closure; change the verdict only if the reason below"
+                           " says to. It was refused only for: "
+                           + previous["reason"] + ".")
+            result = self.role("reviewer", stage, detail, prior=prior)
             if result.get("status") != "REVIEW_NOT_IMPORTED" or result.get("retryable") is not True:
                 return result
+
+    def decision(self, stage, findings):
+        """Write-once record of what only the operator can decide, with the three ways forward."""
+        path = self.attempt / f"decision-{len(self.steps):04d}.json"
+        text = " ".join(str(finding.get(field, "")) for finding in findings for field in ("artifact", "evidence", "repair"))
+        requirements = [r["id"] for r in self.project.load()["requirements"] if cites(text, r["id"])]
+        _write_once(path, {"phase": stage, "created_at": _utc(), "cited_requirements": requirements,
+            "findings": [{**{field: finding.get(field) for field in ("id", "severity", "artifact", "evidence", "repair")},
+                          **{field: finding[field] for field in ("contract_text", "design_text") if field in finding}}
+                         for finding in findings],
+            "actions": ["Amend requirements.md to settle the question, then record user approval of the revised document",
+                        "Write .matlab-harness/counterevidence.md rejecting the claim with evidence; reviewers read it",
+                        "Revise the accepted baseline explicitly (matlab-harness revise) when an accepted checkpoint must change"]})
+        return path.relative_to(self.project.root).as_posix()
+
+    def mutation(self, stage, checked):
+        """Plant defects in copies and run the configured test check, when configured for this stage."""
+        config = self.project.load().get("runtime", {}).get("mutation") or {}
+        if checked["status"] != "PASSED" or stage not in config.get("stages", ["verification"]) or not config.get("check"):
+            return None
+        data = self.project.load()
+        current = value_digest(self.project.snapshot())
+        if data.get("mutation_results", {}).get(stage, {}).get("snapshot_digest") == current:
+            return None
+        limit = config.get("seconds", data.get("budgets", DEFAULT_BUDGETS).get("native", DEFAULT_BUDGETS["native"]))
+        def probe(left):
+            # Advisory evidence: a probe that cannot run never blocks or fails the journey.
+            try:
+                return run_mutation(self.project, self.owner, stage, left)
+            except (ProjectError, OSError, subprocess.SubprocessError) as exc:
+                return {"status": "ERROR", "error": str(exc)}
+        return self.step("mutation", stage, config["check"], probe, limit)
 
     def checks(self, stage):
         data = self.project.load()
@@ -274,6 +360,11 @@ class Journey:
             results.append(result)
             if result["status"] == "BLOCKED":
                 return {"status": "INPUT_REQUIRED", "reason": "Native check unavailable or timed out; inspect owned processes before retry", "checks": results}
+        if all(r["status"] == "PASSED" for r in results) and stage in data.get("semantic_plan", {}).get("stages", []):
+            from .semantics import run as run_semantics
+            semantic = self.step("semantic", stage, "semantic-adequacy", lambda limit: run_semantics(self.project, self.owner, stage, limit),
+                                 data.get("budgets", DEFAULT_BUDGETS).get("native", DEFAULT_BUDGETS["native"]))
+            results.append({**semantic, "name": "semantic-adequacy"})
         return {"status": "PASSED" if all(r["status"] == "PASSED" for r in results) else "FAILED", "checks": results}
 
     def run(self):
@@ -334,7 +425,8 @@ class Journey:
             checked = self.checks(stage)
             if checked["status"] == "INPUT_REQUIRED":
                 return checked
-            reviewed = self.review(stage)
+            self.mutation(stage, checked)
+            reviewed = self.review(stage, checked)
             if reviewed["status"] != "SUCCEEDED":
                 return reviewed
             if not self.approval_current():
@@ -347,12 +439,14 @@ class Journey:
                 continue
             data = self.project.load()
             report = next_step(self.project)["reviews"].get(stage, {})
+            asked = self.project.user_questions(data)
             reserved = [finding for finding in report.get("findings", [])
-                        if finding["severity"] in {"CRITICAL", "MAJOR"} and finding["status"] != "CLOSED"
-                        and _reserved_artifact(self.project, finding["artifact"])]
+                        if finding["severity"] in SERIOUS and finding["status"] != "CLOSED"
+                        and self.project.due(stage, finding, data.get("defects", {})) == stage
+                        and _for_user(self.project, stage, finding, asked)]
             if reserved:
-                return {"status":"INPUT_REQUIRED", "reason":"Blocking findings concern approval or orchestrator-owned records; resolve authorization/counterevidence or check plans before construction repair",
-                        "findings":reserved, "gate":gate}
+                return {"status":"INPUT_REQUIRED", "reason":"Blocking findings concern approval, a user decision, a contract question the design says no reading answers, or orchestrator-owned records; resolve authorization/counterevidence or check plans before construction repair",
+                        "findings":reserved, "gate":gate, "decision": self.decision(stage, reserved)}
             if any(problem.startswith("Protected out-of-scope file changed") for problem in gate["problems"]):
                 return {"status": "INPUT_REQUIRED", "reason": "Protected out-of-scope files changed and could not be restored; inspect them", "gate": gate}
             obligations = [problem for problem in gate["problems"] if problem.startswith("Handoff obligation:")]
@@ -360,7 +454,12 @@ class Journey:
                 return {"status": "INPUT_REQUIRED", "reason": "Reviewer supplied no actionable repair; resolve evidence or modeling questions", "gate": gate}
             if data["repairs"] >= data["repair_budget"]:
                 return {"status": "REPAIR_BUDGET_EXHAUSTED", "gate": gate}
-            result = self.role("repair", stage, "Target only the actual current review findings and failed native checks. " + json.dumps({"review": report, "checks": checked, "gate": gate}))
+            # The packet already lists this checkpoint's findings; send only what is new.
+            open_findings = [f["id"] for f in report.get("findings", []) if f["status"] != "CLOSED"]
+            summary = check_summary(checked)
+            result = self.role("repair", stage, "Target only the open review findings " + ", ".join(open_findings)
+                               + " and failed native checks. " + _gate_text(gate["problems"], summary["checks"])
+                               + " " + json.dumps({"verdict": report.get("verdict"), "checks": summary}))
             if result["status"] != "SUCCEEDED":
                 return result
             # The successful repair record suppresses unnecessary rebuilding while

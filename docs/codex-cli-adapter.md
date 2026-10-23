@@ -39,6 +39,8 @@ runtime = {'adapter': 'command', 'model': 'your-builder-model',
            'argv': base + ['--role', 'builder'],
            'roles': {role: {'argv': base + ['--role', role]}
                      for role in ('builder', 'reviewer', 'repair')}}
+# The reviewer writes its probes in this packet's scratch; the guard excludes exactly that folder.
+runtime['roles']['reviewer']['argv'] += ['--scratch', '{scratch}']
 # Replace with an actually supported, independently verified reviewer identity.
 runtime['roles']['reviewer']['model'] = 'your-verified-review-model'
 Path('runtime.json').write_text(json.dumps(runtime, indent=2) + '\n')
@@ -66,8 +68,13 @@ This requires that the operator permits native tool execution. It is an evidence
 guard, not OS isolation. The script does not alter global host settings.
 
 The guard refuses links/reparse points without traversing them and covers ordinary
-project files and durable controls. It excludes root `.git` and the parent's active
-`.matlab-harness/packets`. Restored-before-inspection changes, out-of-project writes and shared
+project files and durable controls. It excludes root `.git`, the parent's active
+`.matlab-harness/packets` and, when `--scratch {scratch}` is passed, exactly this packet's
+`.matlab-harness/scratch/<packet>` folder, where the reviewer writes its probes. Implementation,
+verification and handoff need those probes, so a `sandbox-read-only` reviewer fails there before
+the model call: use `--reviewer-access scope-guarded-native`. The checkpoint is read from the
+`packet.json` of the packet whose `execution` folder holds the prompt; a reviewer prompt outside a
+packet, or a `--scratch` of a different packet, also fails before the model call. Restored-before-inspection changes, out-of-project writes and shared
 MATLAB state are outside its proof. Direct reviewer simulation outputs and caches
 to scratch outside the project; serialize shared MATLAB through the orchestrator.
 The core additionally checks scoped-artifact freshness and actual contributor

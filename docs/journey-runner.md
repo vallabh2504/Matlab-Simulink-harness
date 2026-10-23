@@ -122,6 +122,18 @@ repair. That orchestrator can supply authorization counterevidence, refine an
 unaccepted check plan or request genuinely missing user input. File/line spellings
 and project-local absolute paths identify the same reserved record.
 
+A question about the approved `requirements.md` raised at requirements does not pause
+there: it is due at architecture (key `architecture:<id>`, `raised_at: requirements`),
+where the design answers it by ID with a reading the contract's text allows. A record
+already stored under `requirements:<id>` stays there and is closed there. After
+requirements, a serious finding on `requirements.md` stays open only when it quotes the
+conflicting `requirements.md` sentence (`contract_text`) and the design's own sentence
+(`design_text`) exactly. The design is then repaired; the journey pauses for the user
+only once the design writes `USER QUESTION <id>:`, saying no reading fits, and the
+decision record carries both quotes. A finding that names another file besides
+`requirements.md` is the builder's to repair. Every question raised at requirements is
+cited by ID in a scoped document at handoff.
+
 Re-run the same command after resolving an approval or input request. The current
 stage resumes; accepted stages are not accepted twice. Editing accepted handoff
 artifacts requires an explicit baseline revision. Changed requirement documents

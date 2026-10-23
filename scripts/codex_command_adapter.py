@@ -8,8 +8,36 @@ from datetime import datetime, timezone
 import argparse, hashlib, json, math, os, subprocess, sys, uuid
 
 
-def review_inventory(root):
-    """Guard source and durable controls, excluding the parent's active packets."""
+EXECUTED_CHECKPOINTS={'implementation','verification','handoff'}
+
+
+def packet_scratch(root, scratch):
+    """The one packet scratch directory a reviewer may write, relative to the project, or None."""
+    if not scratch:
+        return None
+    relative=Path(os.path.abspath(scratch)).relative_to(Path(os.path.abspath(root)))
+    if len(relative.parts)!=3 or relative.parts[:2]!=('.matlab-harness','scratch'):
+        raise ValueError('Reviewer scratch must be one .matlab-harness/scratch/<packet> directory')
+    return relative.parts
+
+
+def packet_checkpoint(root, prompt_file, scratch=None):
+    """The checkpoint of the packet a prompt belongs to; the runtime writes each attempt's prompt at
+    .matlab-harness/packets/<packet>/execution/<attempt>/prompt.md."""
+    packets=Path(os.path.abspath(root))/'.matlab-harness'/'packets'
+    relative=Path(os.path.abspath(prompt_file)).relative_to(packets)
+    if len(relative.parts)<2:
+        raise ValueError('Reviewer prompt must sit inside one .matlab-harness/packets/<packet> directory')
+    if scratch and scratch[2]!=relative.parts[0]:
+        raise ValueError('Reviewer scratch belongs to a different packet than the prompt')
+    record=json.loads((packets/relative.parts[0]/'packet.json').read_text(encoding='utf-8'))
+    if not isinstance(record,dict):
+        raise ValueError('packet.json is not one JSON object')
+    return record.get('checkpoint')
+
+
+def review_inventory(root, scratch=None):
+    """Guard source and durable controls, excluding the parent's active packets and this packet's scratch."""
     result={}
     for directory,names,files in os.walk(root,topdown=True,followlinks=False):
         kept=[]
@@ -18,7 +46,7 @@ def review_inventory(root):
             if folder.is_symlink() or getattr(folder.lstat(),'st_file_attributes',0)&0x400:
                 raise ValueError('Read-only review inventory refuses link/reparse traversal')
             relative=folder.relative_to(root)
-            if relative.parts==('.git',) or relative.parts==('.matlab-harness','packets'):
+            if relative.parts==('.git',) or relative.parts==('.matlab-harness','packets') or relative.parts==scratch:
                 continue
             kept.append(name)
         names[:]=kept
@@ -183,6 +211,7 @@ def main():
     parser.add_argument('--node', required=True)
     parser.add_argument('--codex-js', required=True)
     parser.add_argument('--codex-home', required=True)
+    parser.add_argument('--scratch', help='this packet\'s scratch directory, the one place a reviewer writes')
     args = parser.parse_args()
     source_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     project = Path(args.project).resolve()
@@ -226,12 +255,16 @@ def main():
         effective_schema = evidence / 'native-output-schema.json'
         effective_schema.write_text(json.dumps(strict_schema, indent=2)+'\n', encoding='utf-8')
         (evidence / 'original-output-schema.json').write_text(json.dumps(original_schema,indent=2)+'\n',encoding='utf-8')
-        prompt += '\nNative structured output requires all declared fields. For an inapplicable optional string field such as prior_finding_digest, emit an empty string. No field or verdict is supplied by the wrapper.\n'
+        prompt += '\nNative structured output requires all declared fields. For an inapplicable optional string field such as impact or closure, emit an empty string. No field or verdict is supplied by the wrapper.\n'
         argv += ['--output-schema', str(effective_schema)]
     argv += ['-']
     started = utc()
     try:
-        review_before=review_inventory(project) if args.role=='reviewer' else None
+        scratch=packet_scratch(project,args.scratch) if args.role=='reviewer' else None
+        checkpoint=packet_checkpoint(project,args.prompt_file,scratch) if args.role=='reviewer' else None
+        if args.role=='reviewer' and args.reviewer_access=='sandbox-read-only' and checkpoint in EXECUTED_CHECKPOINTS:
+            raise ValueError('executed checkpoints need a writable scratch: use --reviewer-access scope-guarded-native')
+        review_before=review_inventory(project,scratch) if args.role=='reviewer' else None
     except (OSError,ValueError) as exc:
         envelope={'status':'FAILED','session_id':None,'model':None,'response':None,
                   'failure':'Reviewer inventory unavailable before dispatch: '+str(exc),
@@ -318,7 +351,7 @@ def main():
     review_unchanged=None
     if review_before is not None:
         try:
-            review_unchanged=review_inventory(project)==review_before
+            review_unchanged=review_inventory(project,scratch)==review_before
         except (OSError,ValueError) as review_error:
             review_unchanged=False
             failure=failure or 'Reviewer inventory unavailable: '+str(review_error)
@@ -335,7 +368,7 @@ def main():
         'reasoning_effort_provenance':'OBSERVED_LOCAL_CONTEXT' if observations and all(item.get('reasoning_effort') for item in observations) and len(efforts)==1 else 'UNKNOWN_LOCAL_CONTEXT',
         'transport_source':str(Path(__file__).resolve()),'transport_source_sha256':source_sha256,'transport_source_unchanged':source_unchanged,
         'reviewer_access':args.reviewer_access,'reviewer_inventory_unchanged':review_unchanged,
-        'reviewer_guard_scope':'Whole project except .git and parent-owned .matlab-harness/packets; post-execution evidence guard, not OS sandbox',
+        'reviewer_guard_scope':'Whole project except .git, parent-owned .matlab-harness/packets and this packet\'s scratch; post-execution evidence guard, not OS sandbox',
         'failure':failure, 'native_errors':native_errors, 'cleanup':cleanup, 'raw_evidence':str(evidence), 'child_context_coverage':'UNKNOWN',
         'claim':'Native transport completion only; project import and independent acceptance remain separate'}
     (evidence / 'receipt.json').write_text(json.dumps(envelope, indent=2) + '\n', encoding='utf-8')

@@ -25,12 +25,12 @@ refer to the shared docs, examples and MATLAB helpers.
 
 ## Option 2: install the wheel
 
-Download `matlab_engineering_harness-0.3.0-py3-none-any.whl` from the
-[0.3.0 release](https://github.com/vallabh2504/Matlab-Simulink-harness/releases/tag/v0.3.0),
+Download `matlab_engineering_harness-0.4.0-py3-none-any.whl` from the
+[0.4.0 release](https://github.com/vallabh2504/Matlab-Simulink-harness/releases/tag/v0.4.0),
 then check the download against `SHA256SUMS.txt` from the same release:
 
 ```powershell
-Get-FileHash .\matlab_engineering_harness-0.3.0-py3-none-any.whl -Algorithm SHA256
+Get-FileHash .\matlab_engineering_harness-0.4.0-py3-none-any.whl -Algorithm SHA256
 ```
 
 On macOS or Linux, run `sha256sum -c SHA256SUMS.txt --ignore-missing`. Then install
@@ -38,7 +38,7 @@ the wheel into a virtual environment:
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\python -m pip install --no-deps .\matlab_engineering_harness-0.3.0-py3-none-any.whl
+.venv\Scripts\python -m pip install --no-deps .\matlab_engineering_harness-0.4.0-py3-none-any.whl
 .venv\Scripts\matlab-harness --help
 ```
 

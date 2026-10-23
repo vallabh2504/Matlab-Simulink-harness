@@ -16,3 +16,5 @@ Read [MATLAB/numerical standard](../../docs/standards/matlab.md) for thermal/cal
 Worked exercise: frame steady 1-D conduction as `-k T''=q`, fixed end temperatures, constant k, SI units and positive length/conductivity. Derive the constant-source analytic solution independently and predeclare a nonquadratic grid-refinement check. Explain why the quadratic case alone cannot establish convergence order. The implementation and executed independent grader are in [engineering core](../../examples/engineering-core).
 
 Outputs: approved project requirements, governing-equation/units record, decision provenance, acceptance plan and independent requirements/architecture findings. Use the CLI's approval command only with actual recorded authorization. Discovery is not verified engineering delivery; unsupported products and uncertain assumptions remain explicit.
+
+Short cards with runnable snippets, inlined into task packets: [requirements](../cards/requirements.md), [parameters](../cards/parameters.md).

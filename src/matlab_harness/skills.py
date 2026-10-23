@@ -83,3 +83,40 @@ def select_for(stage, role, text, root=None):
     if any(signal in text.lower() for signal in SIMULINK_SIGNALS):
         names.append("engineering-simulink-engineering")
     return [entries[name] for name in dict.fromkeys(names) if name in entries][:3]
+
+
+# Short cards with runnable snippets are inlined into packets so a small model
+# does not have to open long skill files. Order is priority: the budget trims from the end.
+STAGE_CARDS = {
+    ("requirements", "builder"): ["requirements"], ("requirements", "reviewer"): ["requirements"],
+    ("requirements", "repair"): ["requirements"],
+    ("architecture", "builder"): ["{core}"], ("architecture", "reviewer"): ["{core}"],
+    ("architecture", "repair"): ["{core}"],
+    ("implementation", "builder"): ["{core}", "matlab-unittest", "matlab-errors"],
+    ("implementation", "reviewer"): ["verification", "{core}"],
+    ("implementation", "repair"): ["matlab-errors", "{core}", "matlab-unittest"],
+    ("verification", "builder"): ["verification", "matlab-unittest"],
+    ("verification", "reviewer"): ["verification"],
+    ("verification", "repair"): ["matlab-errors", "matlab-unittest"],
+    ("handoff", "builder"): ["verification"], ("handoff", "reviewer"): ["verification"],
+    ("handoff", "repair"): ["matlab-errors"],
+}
+TOPIC_SIGNALS = {"plotting": ("plot", "figure", "chart", "graph"),
+                 "parameters": ("parameter", "calibrat", "provenance", "datasheet")}
+
+
+def cards_for(stage, role, text, root=None, limit=3):
+    base = toolkit_root(root) / "skills" / "cards"
+    lowered = text.lower()
+    core = "simulink-construction" if any(s in lowered for s in SIMULINK_SIGNALS) else "matlab-numerics"
+    names = [name.format(core=core) for name in STAGE_CARDS.get((stage, role), [])]
+    if stage in {"architecture", "implementation"}:
+        # A card the task names outranks the generic stage cards after the first.
+        topics = [topic for topic, words in TOPIC_SIGNALS.items() if any(w in lowered for w in words)]
+        names = names[:1] + topics + names[1:]
+    cards = []
+    for name in dict.fromkeys(names):
+        path = base / (name + ".md")
+        if path.is_file() and len(cards) < limit:
+            cards.append({"name": name, "path": str(path), "text": path.read_text(encoding="utf-8")})
+    return cards

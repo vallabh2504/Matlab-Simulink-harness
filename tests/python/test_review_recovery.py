@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'src'))
-from matlab_harness.journey import run_journey, _reserved_artifact
+from matlab_harness.journey import run_journey
 from matlab_harness.project import Project, ProjectError, atomic_json, value_digest
 from matlab_harness.workflow import execute, packet, start
 
@@ -32,30 +32,33 @@ if role!='reviewer':
     elif stage=='implementation': Path('engineering/model.m').write_text('function y=model(x), y=x; end')
     response='Synthetic role completed'
 else:
-    findings=[];dispositions=[];verdict='ACCEPT'
-    for key,item in data.get('defects',{}).items():
-        if item['checkpoint']==stage:
-            findings.append({**item['origin'],'status':'CLOSED','prior_finding_digest':item['origin_digest'],
-                'evidence':'Observed isolated identity fixture source; diagnostic only','closure':'Independent local fixture inspection'})
+    from matlab_harness.answer import open_items
+    findings=[];items={};verdict='ACCEPT'
+    current=open_items(p,data,stage)
+    for handle,item in current.items():
+        if item['type']=='finding':
+            items[handle]=dict(status='CLOSED',evidence='Observed isolated identity fixture source; diagnostic only')
     bad=stage=='requirements' and (mode=='protocol-always' or mode.startswith('protocol-') and attempt==1)
     if bad:
-        findings[0]['artifact']='engineering/design.md'
         verdict='REJECT'
         if mode.startswith('protocol-major'):
             findings.append(dict(id='NEW-1',severity='MAJOR',kind='POTENTIAL DEFECT',artifact='engineering/model.m',
                 evidence='Unverified serious allegation in rejected diagnostic report',impact='Identity might be wrong',
                 repair='Inspect actual fixture source',closure='Independent evidence or counterevidence',status='OPEN'))
     elif stage=='requirements' and mode in {'protocol-major-close','protocol-major-track'}:
-        for key,item in p.pending_review_findings(data).items():
-            disposition=dict(finding_digest=key,status='CLOSED',finding_id='',
-                evidence='Reopened fixture source is the identity function; alleged wrong equation is absent',
-                closure='Independent current-byte diagnostic counterevidence, not engineering proof')
-            if mode=='protocol-major-track':
-                disposition.update(status='TRACKED',finding_id='NEW-1')
-                findings.append(item['finding']);verdict='REJECT'
-            dispositions.append(disposition)
-    response=dict(checkpoint=stage,verdict=verdict,findings=findings,
-        protocol_dispositions=dispositions,snapshot_digest=value_digest(p.snapshot()),**charter(p))
+        for handle,item in current.items():
+            if item['type']=='allegation' and mode=='protocol-major-close':
+                items[handle]=dict(status='CLOSED',evidence='Reopened fixture source is the identity function; alleged wrong equation is absent')
+            elif item['type']=='allegation':
+                items[handle]=dict(status='STILL_OPEN',evidence='Allegation still holds on current bytes');verdict='REJECT'
+    if mode=='reject-moderate' and stage=='requirements':
+        findings.append(dict(id='MOD-1',severity='MODERATE',kind='EVIDENCE GAP',artifact='engineering/model.m',
+            evidence='Oracle tolerance unstated',impact='Ambiguous diagnostic evidence',repair='State the tolerance',
+            closure='Tolerance documented',status='OPEN'))
+        if attempt==1: verdict='REJECT'
+    response=dict(checkpoint=stage,verdict=verdict,findings=findings,open_items=items,
+        snapshot_digest=value_digest(p.snapshot()),**charter(p))
+    if bad: response['verdict']='MAYBE'
 print(json.dumps(dict(status='SUCCESS',session_id='synthetic-'+role+'-'+str(len(calls)),
     model='synthetic subprocess fixture, not AI',response=response)))
 '''
@@ -68,7 +71,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         (self.root / 'engineering').mkdir()
         (self.root / 'engineering/model.m').write_text('function y=model(x), y=x; end')
-        start(self.root, 'Protocol diagnostic', 'builder', 'owner', ['engineering'])
+        start(self.root, 'Protocol diagnostic', 'builder', 'owner', ['engineering'], proof_mode="legacy-attested")
         self.p = Project(self.root)
         self.p.add_requirement('owner', 'R1', 'Identity', 'Isolated diagnostic probe', 'synthetic fixture')
         self.p.approve('owner', 'fixture-human', 'Explicit synthetic authorization')
@@ -98,7 +101,7 @@ class ReviewRecoveryTests(unittest.TestCase):
         p = self.root / 'calls.json'
         return json.loads(p.read_text()) if p.exists() else []
 
-    def test_exact_artifact_drift_is_retained_then_reviewer_corrects_it(self):
+    def test_malformed_report_is_retained_then_reviewer_corrects_it(self):
         original = self.seed()
         self.mode('protocol-once')
         result = run_journey(self.root, 'owner', 60, stop_after='requirements')
@@ -109,11 +112,22 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(len(data['review_protocol_failures']), 1)
         rejected = next(iter(data['review_protocol_failures'].values()))
         raw = json.loads((self.root / rejected['path']).read_text())
-        self.assertEqual(raw['findings'][0]['artifact'], 'engineering/design.md')
+        self.assertEqual(raw['verdict'], 'MAYBE')
         self.assertEqual(data['defects']['requirements:OLD-1']['origin'], original)
         self.assertEqual(data['defects']['requirements:OLD-1']['finding']['artifact'], original['artifact'])
         self.assertGreater(result['wall_seconds'], 0)
         self.assertLess(result['remaining_seconds'], 60)
+
+    def test_a_reject_without_a_blocking_reason_is_corrected_not_repaired(self):
+        self.mode('reject-moderate')
+        result = run_journey(self.root, 'owner', 60, stop_after='requirements')
+        self.assertEqual(result['status'], 'CHECKPOINT_REACHED', result)
+        self.assertEqual([c['role'] for c in self.calls()], ['reviewer', 'reviewer'])
+        data = self.p.load()
+        self.assertEqual(data['repairs'], 0)
+        refused = next(iter(data['review_protocol_failures'].values()))
+        self.assertIn('REJECT needs a blocking reason', refused['reason'])
+        self.assertEqual(data['defects']['requirements:MOD-1']['finding']['status'], 'OPEN')
 
     def test_protocol_retry_is_bounded_and_resume_cannot_reset_counter(self):
         self.seed(); self.mode('protocol-always')
@@ -182,8 +196,8 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual(len(self.calls()), 1)
 
     def test_crash_before_raw_report_write_retains_import_intent_and_response(self):
-        from matlab_harness import workflow
-        real_write = workflow.atomic_json
+        from matlab_harness import answer
+        real_write = answer.atomic_json
 
         def interrupted_write(path, value):
             if Path(path).name == 'review.json':
@@ -191,7 +205,7 @@ class ReviewRecoveryTests(unittest.TestCase):
             return real_write(path, value)
 
         self.seed(); self.mode('protocol-major-drop')
-        with patch.object(workflow, 'atomic_json', side_effect=interrupted_write):
+        with patch.object(answer, 'atomic_json', side_effect=interrupted_write):
             with self.assertRaises(OSError):
                 execute(self.p, 'owner', 'reviewer')
         run = self.p.load()['runs'][0]
@@ -251,14 +265,15 @@ class ReviewRecoveryTests(unittest.TestCase):
         self.assertEqual((self.root / 'engineering/model.m').read_bytes(), before)
 
     def test_combined_control_locations_and_stage_specific_packet(self):
-        self.assertTrue(_reserved_artifact(self.p, 'engineering/model.m; requirements.md; .matlab-harness/project.json:4'))
-        self.assertFalse(_reserved_artifact(self.p, 'engineering/model.m; engineering/design.md'))
+        self.assertTrue(self.p.reserved_location('engineering/model.m; requirements.md; .matlab-harness/project.json:4'))
+        self.assertFalse(self.p.reserved_location('engineering/model.m; engineering/design.md'))
         prompt = Path(packet(self.p, 'repair')['prompt']).read_text()
         self.assertIn('do not implement it', prompt)
         self.assertNotIn('add a meaningful regression probe', prompt)
         reviewed = Path(packet(self.p, 'reviewer')['prompt']).read_text()
         self.assertIn('Missing future implementation', reviewed)
-        self.assertIn('EXACTLY', reviewed)
+        self.assertIn('open_items', reviewed)
+        self.assertNotIn('snapshot_digest', reviewed)
 
     def test_focused_context_retains_truth_without_repeating_repair_transcripts(self):
         self.seed()

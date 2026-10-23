@@ -30,6 +30,54 @@ class RuntimeTests(unittest.TestCase):
         for key in ("stdout", "stderr"):
             self.assertTrue(Path(result["artifacts"][key]).is_file())
 
+    def test_json_only_capability_keeps_review_decoder(self):
+        result=self.run_fixture("import json,sys\nassert sys.argv[4]==''\nprint(json.dumps(dict(status='SUCCESS',session_id='r',model='fixture',response='```json\\n{\"verdict\":\"REJECT\"}\\n```')))\n",
+                                {'type':'object'},capabilities={'response_mode':'json'})
+        self.assertEqual(result['status'],'SUCCEEDED');self.assertEqual(result['response']['verdict'],'REJECT')
+        self.assertIn('ingestion',result)
+
+    def test_invalid_utf8_is_retained_as_unread_source(self):
+        result=self.run_fixture("import sys\nsys.stdout.buffer.write(b'\\xff')\n",{'type':'object'})
+        self.assertEqual(result['status'],'MALFORMED')
+        self.assertTrue(result['ingestion']['problems'])
+        self.assertEqual(Path(result['ingestion']['sources'][0]['artifact']).read_bytes(),b'\xff')
+
+    def test_response_size_limit_stops_without_accepting_prefix(self):
+        result=self.run_fixture("print('x'*2048)\n",{'type':'object'},capabilities={'max_response_bytes':1024})
+        self.assertEqual(result['status'],'MALFORMED');self.assertEqual(result['failure']['category'],'unread_source')
+        self.assertGreater(result['ingestion']['sources'][0]['bytes'],1024)
+
+    def test_provider_failures_classified_without_fallback(self):
+        for code,category in ((404,'permanent_model_unavailable'),(401,'permanent_authentication'),(503,'transient_transport')):
+            result=self.run_fixture("import sys\nprint('provider HTTP "+str(code)+"',file=sys.stderr)\nsys.exit(1)\n")
+            self.assertEqual(result['failure']['category'],category)
+            self.assertFalse(result['failure']['automatic_fallback'])
+            self.assertIsNone(result['usage'])
+    def test_a_usage_limit_is_named_and_not_retried(self):
+        message="Provider result: success You've hit your session limit · resets 9:30am"
+        result=self.run_fixture("import json,sys\nprint(json.dumps(dict(status='FAILED',session_id='r',model='fixture',response=None,error="
+                                +repr(message)+")))\nsys.exit(1)\n",{'type':'object'})
+        self.assertEqual(result['failure']['category'],'provider_usage_limit')
+        self.assertFalse(result['failure']['transient'])
+        for message in ("Provider result: error_during_execution 429 Weekly limit reached - resets Mon",
+                        "5-hour limit reached","You have reached your specified API usage limits"):
+            result=self.run_fixture("import json,sys\nprint(json.dumps(dict(status='FAILED',session_id='r',model='fixture',response=None,error="
+                                    +repr(message)+")))\nsys.exit(1)\n",{'type':'object'})
+            self.assertEqual(result['failure']['category'],'provider_usage_limit',message)
+    def test_command_envelope_children_are_cleaned(self):
+        result=self.run_fixture("import json\nprint(json.dumps(dict(status='SUCCEEDED',session_id='r',model='fixture',response={'verdict':'REJECT'},"
+                                "child_session_ids=['c1','r',3,'','c1','c2'])))\n",{'type':'object'})
+        self.assertEqual(result['child_session_ids'],['c1','c2'])
+        result=self.run_fixture("import json\nprint(json.dumps(dict(status='SUCCEEDED',session_id='r',model='fixture',response={'verdict':'REJECT'},"
+                                "child_session_ids='c1')))\n",{'type':'object'})
+        self.assertEqual(result['child_session_ids'],[])
+    def test_provider_error_field_is_retained_and_classified(self):
+        result=self.run_fixture("import json\nprint(json.dumps(dict(event='result',result=dict(status='ERROR',error='UNAVAILABLE code 503',conversation_id='r',response={'verdict':'REJECT'}))))\n",{'type':'object'})
+        self.assertEqual(result['status'],'FAILED')
+        self.assertEqual(result['provider_error'],'UNAVAILABLE code 503')
+        self.assertEqual(result['failure']['category'],'transient_transport')
+        self.assertFalse(result['failure']['automatic_fallback'])
+
     def test_success_actual_identity_and_prompt_file(self):
         result = self.run_fixture(
             "import json,sys\nfrom pathlib import Path\n"
@@ -76,6 +124,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNotNone(result["exit_code"])
         self.assertEqual(result["cleanup"]["external_service_cancellation"], "UNKNOWN")
         self.assertFalse(result["cleanup"]["descendant_stop_verified"])
+        self.assert_durable(result)
+
+    def test_process_lingering_after_root_result_is_stopped_and_succeeds(self):
+        events = [{"event": "init", "conversation_id": "root", "init": {"model": "observed"}},
+                  {"event": "result", "result": {"conversation_id": "root", "status": "SUCCESS",
+                                                  "structured_output": {"verdict": "ACCEPT"}}}]
+        result = self.run_fixture("import json,time\nfor event in " + repr(events) + ": print(json.dumps(event),flush=True)\n"
+                                  "time.sleep(60)\n", {"type": "object"}, timeout=30, result_grace=0)
+        self.assertEqual(result["status"], "SUCCEEDED")
+        self.assertTrue(result["stopped_after_result"])
+        self.assertTrue(result["cleanup"]["root_stopped"])
+        self.assertEqual(result["response"], {"verdict": "ACCEPT"})
+        self.assertLess(result["wall_seconds"], 20)
         self.assert_durable(result)
 
     def test_child_result_cannot_complete_root(self):

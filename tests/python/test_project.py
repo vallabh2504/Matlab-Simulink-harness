@@ -18,7 +18,7 @@ class ProjectTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         (self.root / "src").mkdir()
         (self.root / "src" / "temperature.m").write_text("function T=f(t), T=exp(-t); end\n")
-        self.project = Project.initialize(self.root, "Cooling", "actual-builder", ["src"])
+        self.project = Project.initialize(self.root, "Cooling", "actual-builder", ["src"], proof_mode="legacy-attested")
         self.project.claim("orchestrator")
         self.project.add_requirement("orchestrator", "TH-1", "Conserve thermal energy", "closed form", "user brief", "J")
         self.project.configure_checks("orchestrator", "requirements", {})
@@ -85,6 +85,63 @@ class ProjectTests(unittest.TestCase):
         for timeout in (True,float('nan'),float('inf')):
             with self.subTest(timeout=timeout):
                 with self.assertRaises(ProjectError):self.project.run_check('orchestrator','slow',timeout=timeout)
+
+    def test_a_large_check_output_is_bounded_and_keeps_its_middle_error_lines(self):
+        from matlab_harness.compact import matlab_digest
+        noisy = ("import sys; w=sys.stdout.write; "
+                 "[w('progress %d\\n' % i) for i in range(40000)]; w('Error using simulateCellET\\n'); "
+                 "w('Input must be numeric.\\n'); [w('tail %d\\n' % i) for i in range(40000)]")
+        self.project.configure_checks("orchestrator", "verification", {"noisy": [sys.executable, "-c", noisy]})
+        result = self.project.run_check("orchestrator", "noisy")
+        self.assertTrue(result["truncated"])
+        raw = self.root / result["raw_output"]["stdout"]["path"]
+        self.assertEqual(result["output_bytes"]["stdout"], raw.stat().st_size)
+        self.assertLess(len(result["stdout"]), raw.stat().st_size)
+        self.assertLess(len(result["stdout"].encode()), 300 * 1024)
+        self.assertIn(result["raw_output"]["stdout"]["path"], result["stdout"])
+        self.assertIn("Error using simulateCellET | Input must be numeric.", matlab_digest(result["stdout"]))
+        self.assertIn("tail 39999", result["stdout"])
+
+    def test_bounded_stream_edges(self):
+        from matlab_harness import project as module
+        from matlab_harness.compact import matlab_digest
+        path, limit = self.root / "stream.txt", module.STREAM_HEAD + module.STREAM_TAIL
+        for size in (0, limit):
+            path.write_bytes(b"x" * size)
+            self.assertEqual(module.bounded_stream(path, "stream.txt"), ("x" * size, size, False))
+        path.write_bytes(b"x" * (limit + 1))
+        text, size, cut = module.bounded_stream(path, "stream.txt")
+        self.assertEqual((size, cut), (limit + 1, True))
+        self.assertLess(len(text), limit + 300)
+        # An error straddling the head boundary, and warnings that would fill every slot before it.
+        filler = b"p\n" * ((module.STREAM_HEAD - 6) // 2)
+        flood = b"".join(b"Warning: Matrix is close to singular. RCOND = %d.\n> In f (line 12)\n" % i for i in range(1000))
+        path.write_bytes(filler + b"Error using g\nFirst cause.\n" + flood + b"Error using h\nReal cause.\n" + b"t\n" * limit)
+        text = module.bounded_stream(path, "stream.txt")[0]
+        self.assertIn("Error using g | First cause.", matlab_digest(text))
+        self.assertIn("Error using h | Real cause.", matlab_digest(text))
+        self.assertLessEqual(text.count("Warning:"), module.STREAM_WARNING_LINES)
+
+    def test_a_truncated_stderr_alone_marks_the_record(self):
+        command = [sys.executable, "-c", "import sys; sys.stderr.write('e\\n' * 200000)"]
+        self.project.configure_checks("orchestrator", "verification", {"loud": command})
+        result = self.project.run_check("orchestrator", "loud")
+        self.assertTrue(result["truncated"])
+        self.assertLess(result["output_bytes"]["stdout"], 10)
+
+    def test_recovering_a_lock_names_a_check_that_never_finished(self):
+        atomic_json(self.root / ".matlab-harness/evidence/abc-started.json", {"name": "oracle", "pid": 4242, "status": "STARTED"})
+        atomic_json(self.root / ".matlab-harness/mutation.lock", {"token": "t", "pid": 0, "created": "old"})
+        with self.assertRaisesRegex(ProjectError, "oracle \\(pid 4242"):
+            self.project.claim("other")
+        self.assertEqual(self.project.recover_lock("t")["unfinished_checks"][0]["pid"], 4242)
+        self.project.run_check("orchestrator", "oracle")
+        self.assertEqual([c["pid"] for c in self.project.unfinished_checks()], [4242])
+
+    def test_a_small_check_output_is_embedded_whole(self):
+        result = self.project.run_check("orchestrator", "oracle")
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["output_bytes"]["stderr"], 0)
 
     def test_verification_mutating_source_fails(self):
         command = [sys.executable, "-c", "from pathlib import Path; Path('src/temperature.m').write_text('changed')"]
@@ -281,7 +338,7 @@ class ProjectTests(unittest.TestCase):
         with self.assertRaises(ProjectError):
             self.project.lease("orchestrator", "bad", "worker", ["../outside"], ["TH-1"])
         with self.assertRaises(ProjectError):
-            Project.initialize(self.root / "other", "bad", "builder", ["."])
+            Project.initialize(self.root / "other", "bad", "builder", ["."], proof_mode="legacy-attested")
 
     @unittest.skipUnless(os.name == 'nt','Windows case-insensitive artifact ownership')
     def test_future_case_aliases_cannot_acquire_two_leases(self):
@@ -290,7 +347,7 @@ class ProjectTests(unittest.TestCase):
         with self.assertRaisesRegex(ProjectError,'collision'):
             self.project.lease('orchestrator','second','worker-2',['src/FUTURE.m'],['TH-1'],kind='discovery')
         with self.assertRaises(ProjectError):
-            Project.initialize(self.root/'control-alias','bad','builder',['.MATLAB-HARNESS'])
+            Project.initialize(self.root/'control-alias','bad','builder',['.MATLAB-HARNESS'], proof_mode="legacy-attested")
 
     def test_accepted_obligations_frozen_and_ordered(self):
         self.approve()
@@ -358,7 +415,7 @@ class ProjectTests(unittest.TestCase):
     def test_init_preserves_existing_requirements_and_never_overwrites(self):
         text = (self.root / "requirements.md").read_text()
         with self.assertRaises(ProjectError):
-            Project.initialize(self.root, "different", "builder", ["src"])
+            Project.initialize(self.root, "different", "builder", ["src"], proof_mode="legacy-attested")
         self.assertEqual((self.root / "requirements.md").read_text(), text)
 
 

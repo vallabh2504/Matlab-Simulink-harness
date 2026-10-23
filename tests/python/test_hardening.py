@@ -10,7 +10,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from matlab_harness.project import Project, ProjectError, atomic_json, cites, value_digest
 from matlab_harness.skills import select_for
-from matlab_harness.workflow import charter_problems, packet, start
+from matlab_harness.answer import translate
+from matlab_harness.workflow import packet, start
 
 CHECK = "function tests = oracle_test, tests = functiontests(localfunctions); end\n"
 
@@ -24,7 +25,7 @@ class HardeningTests(unittest.TestCase):
         (self.root / "src/model.m").write_text("function y=model(x), y=x; end\n")
         (self.root / "checks").mkdir()
         (self.root / "checks/oracle_test.m").write_text(CHECK)
-        start(self.root, "Identity", "fixture-builder", "owner", ["src"], "Identity model")
+        start(self.root, "Identity", "fixture-builder", "owner", ["src"], "Identity model", proof_mode="legacy-attested")
         self.project = Project(self.root)
         self.project.add_requirement("owner", "ID-1", "Identity", "closed form", "user brief")
         self.project.add_requirement("owner", "ID-10", "Scalar input", "closed form", "user brief")
@@ -97,33 +98,46 @@ class HardeningTests(unittest.TestCase):
                     for i in ("ID-1", "ID-10")],
                 "independent_checks": checks if checks is not None else []}
 
-    def test_charter_requires_every_requirement_once(self):
+    def problems(self, response, stage="requirements"):
         scratch = self.root / ".matlab-harness/scratch/t"
-        data = self.project.load()
+        return " ".join(translate(self.project, self.project.load(), stage, response, scratch)[1])
+
+    def test_charter_accept_needs_every_requirement(self):
         rows = [{"requirement": "ID-1", "status": "VERIFIED", "evidence": "probe", "finding_ids": ""}]
-        self.assertIn("ID-10", charter_problems(self.project, self.response(rows=rows), data, "requirements", scratch))
-        self.assertIsNone(charter_problems(self.project, self.response(), data, "requirements", scratch))
+        self.assertIn("missing: ID-10", self.problems(self.response(rows=rows)))
+        self.assertEqual(self.problems(self.response()), "")
+        # The same rows under REJECT are an honest partial answer: ID-10 reads as not assessed.
+        blocking = {"id": "N-1", "severity": "MAJOR", "artifact": "src/f.m", "evidence": "f(0) errors",
+                    "repair": "guard zero"}
+        self.assertEqual(self.problems(self.response("REJECT", rows=rows, findings=[blocking])), "")
+        # Two rows for one requirement keep the weaker status.
+        rows = self.response()["traceability"] + [{"requirement": "id-1", "status": "fail", "evidence": "p2"}]
+        self.assertIn("FAILED requirement ID-1", self.problems(self.response(rows=rows)))
 
     def test_charter_accept_needs_finding_for_unverified_row(self):
-        scratch = self.root / ".matlab-harness/scratch/t"
-        data = self.project.load()
         rows = [{"requirement": "ID-1", "status": "VERIFIED", "evidence": "probe", "finding_ids": ""},
                 {"requirement": "ID-10", "status": "PARTIAL", "evidence": "scalar only", "finding_ids": ""}]
-        self.assertIn("without a finding", charter_problems(self.project, self.response(rows=rows), data,
-                                                            "requirements", scratch))
+        self.assertIn("ID-10 is PARTIAL under ACCEPT; name the open MODERATE or MINOR finding",
+                      self.problems(self.response(rows=rows)))
+        # Only an open finding that does not block explains it: a closed one, or a serious one, does not.
+        rows[1]["finding_ids"] = "N-1"
+        for finding, explains in (({"severity": "MINOR"}, True), ({"severity": "MINOR", "status": "CLOSED"}, False),
+                                  ({"severity": "MAJOR"}, False)):
+            response = self.response(rows=rows)
+            response["findings"] = [{"id": "N-1", "artifact": "src/f.m", "evidence": "scalar only",
+                                     "repair": "vectorize", **finding}]
+            self.assertEqual("ID-10 is PARTIAL" not in self.problems(response), explains)
         rows[1]["status"] = "FAILED"
-        self.assertIn("FAILED", charter_problems(self.project, self.response(rows=rows), data, "requirements", scratch))
+        self.assertIn("FAILED", self.problems(self.response(rows=rows)))
 
     def test_charter_executed_checkpoint_needs_scratch_probe(self):
         scratch = self.root / ".matlab-harness/scratch/t"
-        data = self.project.load()
         builder_test = {"id": "IC-1", "artifact": str(self.root / "checks/oracle_test.m")}
-        problem = charter_problems(self.project, self.response(checks=[builder_test]), data, "implementation", scratch)
-        self.assertIn("not independent review", problem)
+        self.assertIn("not independent review", self.problems(self.response(checks=[builder_test]), "implementation"))
         scratch.mkdir(parents=True)
         (scratch / "probe.m").write_text("% independent oracle\n")
         probe = {"id": "IC-1", "artifact": str(scratch / "probe.m")}
-        self.assertIsNone(charter_problems(self.project, self.response(checks=[probe]), data, "implementation", scratch))
+        self.assertNotIn("not independent review", self.problems(self.response(checks=[probe]), "implementation"))
 
     # Handoff obligations
     def test_handoff_obligations_cite_whole_ids(self):
@@ -154,18 +168,23 @@ class HardeningTests(unittest.TestCase):
         self.assertLessEqual(len(names), 3)
 
     # Prompts stay small for open models
-    def test_prompts_stay_within_budget_and_carry_clipped_findings(self):
+    def test_prompts_preserve_complete_findings_and_refuse_insufficient_budget(self):
         long_evidence = "x" * 2000
         issue = {"id": "REQ-9", "severity": "MINOR", "kind": "EVIDENCE GAP", "artifact": "src/model.m",
                  "evidence": long_evidence, "impact": "gap", "repair": "add case", "closure": "case passes",
                  "status": "OPEN"}
         self.import_review("requirements", [issue])
         for role in ("builder", "reviewer", "repair"):
-            prompt = Path(packet(self.project, role, "implementation")["prompt"]).read_text(encoding="utf-8")
-            self.assertLess(len(prompt.encode("utf-8")), 12000, role)
-            if role != "reviewer":
-                self.assertIn("REQ-9", prompt)
-                self.assertNotIn(long_evidence, prompt)
+            handoff = packet(self.project, role, "implementation")
+            prompt = Path(handoff["prompt"]).read_text(encoding="utf-8")
+            self.assertIn("REQ-9", prompt)
+            # A carried finding is a compact view in the prompt; its full text is in context.json.
+            self.assertNotIn(long_evidence, prompt)
+            self.assertIn("carried_open_findings", prompt)
+            context = json.loads(Path(handoff["context"]).read_text(encoding="utf-8"))
+            self.assertEqual(context["carried_open_findings"]["requirements:REQ-9"]["evidence"], long_evidence)
+            with self.assertRaisesRegex(ProjectError, "Context preflight refused"):
+                packet(self.project, role, "implementation", budget=1000)
 
 
 if __name__ == "__main__":

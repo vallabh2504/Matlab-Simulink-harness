@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matlab-engineering-harness"
-version = "0.3.0"
+version = "0.4.0"
 description = "Evidence-gated MATLAB and Simulink engineering workflows for AI coding agents"
 readme = "README.md"
 authors = [{name = "S V V Sai Sri Vallabh Pataneni"}]

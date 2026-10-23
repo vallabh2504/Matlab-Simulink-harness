@@ -1,5 +1,14 @@
 # Executing native roles
 
+See [evidence assurance](evidence-assurance.md) for executed probe receipts,
+required semantic plans, explicit context capabilities, loss-aware raw review
+ingestion and legacy migration. `native-schema` and `json` response modes enforce
+the same domain checks. Transport failures never trigger model fallback.
+With the `agy` adapter, the plain-text `toolAction` and `toolSummary` notes it adds
+to a result do not count as a conflict between the raw and structured review. Both
+sources are kept. Any other difference still needs reconciliation, and other hosts
+are compared strictly.
+
 ## Operator entry points
 
 Use `matlab-harness start <new-or-existing-directory> --title <title> --builder <actual-id>
@@ -126,6 +135,12 @@ timing and observable provider usage are preserved. These files are local projec
 evidence and can contain private prompts or provider output; they are not sent
 as harness telemetry or automatically bundled into releases.
 
+Some CLIs write their final root result and then do not exit. Once stdout holds a
+valid root result, the runner waits `result_grace` seconds (per-role, default 30)
+for the process to exit, then stops it the same way as a timeout. The attempt is
+`SUCCEEDED` and its receipt has `stopped_after_result: true`; the exit code is the
+one the stop produced.
+
 On timeout/interruption, Windows uses `taskkill /PID <owned-pid> /T /F`; POSIX
 uses a new process group and kills that group. Cleanup is bounded and records
 whether the root stopped. This is not proof that detached children or a provider's
@@ -157,22 +172,36 @@ allows up to three rejected protocol attempts for an unchanged checkpoint and
 snapshot, including correction attempts. Counts survive resuming the project.
 These are reviewer-only corrections within the original time ceiling; they do not
 consume the engineering repair budget. Valid REJECT/INCOMPLETE verdicts follow
-the normal engineering repair path. Identity, stale-snapshot, artifact-mutation
+the normal engineering repair path. A REJECT without a blocking reason (see the
+`verdict` rule in hosts.md) is a protocol refusal, not a valid verdict, so it costs a
+correction attempt and never a repair. Identity, stale-snapshot, artifact-mutation
 and transport failures do not receive this automatic protocol retry.
 
-Complete serious allegations in a rejected report remain separately labeled
-`UNIMPORTED_ALLEGATION`, with the immutable source report and its digest. They
-are not established engineering truth. Before ACCEPT, an independent current-byte
-review must explicitly disposition each allegation in `protocol_dispositions`:
+Serious findings (CRITICAL, MAJOR) of an answer that was not imported remain
+separately labeled `UNIMPORTED_ALLEGATION`, with the immutable source report and its
+digest, whatever kept the answer out: a protocol refusal, a run that did not finish,
+or a reviewer that changed scoped files. They are not established engineering truth.
+The next reviewer packet lists each claim as one open item with a handle (`A-` and
+the first eight hex digits of the claim's digest) and the probes of every attempt
+that made it. The reviewer answers it in `open_items`:
 
-- `CLOSED`: provide observed closure or counterevidence in evidence and closure;
-  `finding_id` can be empty when no ordinary finding is needed.
-- `TRACKED`: name an unresolved CRITICAL/MAJOR finding in the current report.
-  That ordinary finding continues to block acceptance.
+- `CLOSED`: observed closure or counterevidence on the current bytes. At an executed
+  checkpoint the evidence names the scratch file a check with result `PASS` ran, or
+  that check's ID. `CLOSED` counts only written alone as the status.
+- `STILL_OPEN`: the harness records the claim as the reviewer's own open finding,
+  which blocks acceptance like any other. Reporting the identical claim as a new
+  finding means the same.
 
-Each disposition references the supplied `finding_digest`. Reusing an issue ID
-across rejected sources cannot erase a separate allegation. Missing dispositions,
-changed source bytes and omitted earlier blocking findings prevent acceptance.
+Earlier open findings are answered the same way, by their own ID. The harness
+translates the answer into the strict review record (closure digests, origin
+artifacts, allegation dispositions); the reviewer never copies a digest. A new
+finding that reuses an earlier ID is renamed, so it cannot close the earlier one.
+ACCEPT is refused until every blocking item is `CLOSED`.
+
+A reviewer run never changes the scoped files or `requirements.md`. The harness keeps
+a copy of them before the run; if the reviewer changed or added any, it moves the reviewer's versions to
+`execution/reviewer-changes`, restores the reviewed bytes, records a decision and
+does not import the answer.
 
 Review-import intent is committed with the completed runtime response, before
 writing a report file. A crash at either point leaves the response and a pending
@@ -189,6 +218,18 @@ document checkpoint. A reviewer must identify consequential ambiguity from the
 actual contract; it must not invent a metadata schema where equivalent forms
 were explicitly allowed. Repairs describe future executable checks in the design
 and leave their implementation to the implementation stage.
+
+An approved contract binds only through its text, so a question about what it means is
+answered by the design. A finding on `requirements.md` filed at requirements is carried
+to architecture and does not block requirements; the architecture review closes it when
+the design's reading contradicts no contract sentence. A serious finding on the contract
+after requirements needs `contract_text` and `design_text`, exact quotes of the two
+sentences that conflict (compared without case, spacing, markdown marks, list markers,
+curly quotes or closing punctuation; a `design_text` found in `requirements.md` is not the
+design's own reading), or the answer is refused as protocol. Such a conflict is a design
+defect and is repaired; it pauses for the user only when the design itself writes
+`USER QUESTION <id>:`. A finding on a `.matlab-harness/` record is not a contract question
+and still pauses where it is raised.
 
 Both direct `execute` and the journey detect early changes to scoped
 non-document artifacts, including unfamiliar scripts, binaries and parameter

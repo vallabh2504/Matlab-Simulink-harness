@@ -10,14 +10,41 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import string
 import subprocess
 import time
 import uuid
 
+from .project import loads
+
 
 DEFAULT_TIMEOUTS = {"builder": 3600, "reviewer": 1800, "repair": 3600}
+
+
+def classify_failure(receipt):
+    """Classify observed failures without substituting models or restarting budgets."""
+    status=receipt["status"]
+    if status=="SUCCEEDED":return None
+    text=str(receipt.get("provider_status", ""))+" "+str(receipt.get("provider_error", ""))+" "+str(receipt.get("error", ""))
+    stderr=Path(receipt["artifacts"]["stderr"])
+    if stderr.is_file():
+        with stderr.open("rb") as handle:text+=" "+handle.read(65536).decode("utf-8",errors="replace")
+    if receipt.get("ingestion",{}).get("problems"):category="unread_source"
+    elif status=="CONFIG_ERROR":category="configuration"
+    elif re.search(r'\b(?:401|403)\b|unauthorized|authentication|permission denied',text,re.I):category="permanent_authentication"
+    elif re.search(r'\b404\b|model[^\n]{0,80}not found|unknown model',text,re.I):category="permanent_model_unavailable"
+    elif status in {"TIMED_OUT","INTERRUPTED"}:category=status.lower()
+    # A usage limit lasts until its reset, so retrying inside the journey cannot help.
+    elif re.search(r'hit your (?:session |weekly |daily |usage )?limit|\b(?:session|weekly|daily|5-hour|usage) limits? (?:reached|exceeded)|reached your (?:specified )?(?:api )?usage limits?|out of (?:extra )?usage',text,re.I):category="provider_usage_limit"
+    elif re.search(r'\b(?:429|502|503|504)\b|connection reset|temporarily unavailable',text,re.I):category="transient_transport"
+    elif status=="LAUNCH_FAILED":category="configuration"
+    elif status=="MALFORMED":category="protocol_or_identity"
+    else:category="unclassified_failure"
+    return {"category":category,"transient":category=="transient_transport",
+            "automatic_transport_attempts":1,"automatic_fallback":False,
+            "retry_policy":"stop; any explicit retry retains the original journey ceiling"}
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -66,28 +93,73 @@ def _arguments(config: dict, prompt: str, paths: dict, schema: object) -> list[s
     return arguments
 
 
+def _json_in(text: str):
+    # Compatibility view for decoded callers; raw ingress uses the full result.
+    from .decoding import decode_answer
+    return decode_answer(text).answer
+
+
 def _parse_output(text: str, structured: bool) -> dict:
-    """Decode the observed AGY NDJSON or the documented generic JSON envelope."""
+    """Decode the agy NDJSON stream or the documented generic JSON envelope."""
     parsed = {"actual_model": None, "root_session_id": None,
               "child_session_ids": [], "response": None, "raw_response": None,
-              "provider_status": None, "usage": None, "parse_warnings": 0}
-    events = []
-    try:
-        whole = json.loads(text)
-    except (ValueError, TypeError):
-        whole = None
+              "provider_status": None, "provider_error": None, "usage": None, "parse_warnings": 0}
+    from .decoding import decode_document, combine_answers, source_record
+    events, transport_problems, transport_sources, transport_answers = [], [], [], []
+    agy_transport = False
+
+    def review_channels(candidate, agy=False):
+        return combine_answers(candidate.get("structured_output"), candidate.get("response"),
+                               ignore_scalar_fields=("toolAction", "toolSummary") if agy else ())
+
+    def envelope(raw, is_line=False):
+        decoded = decode_document(raw, "transport-envelope")
+        value = decoded.answer
+        if value is None and is_line and raw.lstrip().startswith(("{", "[")):
+            transport_problems.extend(["Malformed JSON transport event: " + p for p in decoded.problems])
+            transport_sources.extend(decoded.sources)
+        if value is not None and decoded.problems:
+            transport_problems.extend(decoded.problems)
+            transport_sources.extend(decoded.sources)
+            def variants(item):
+                if isinstance(item, dict) and set(item) == {"answer_sources"}:
+                    return item["answer_sources"]
+                return [item]
+            for outer in variants(value):
+                if not isinstance(outer, dict):
+                    continue
+                candidates = variants(outer.get("result")) if outer.get("event") == "result" else (
+                    [outer] if "status" in outer else [])
+                for candidate in candidates:
+                    if isinstance(candidate, dict):
+                        recovered = review_channels(candidate, outer.get("event") == "result")
+                        if recovered.answer is not None:
+                            transport_answers.append(recovered.answer)
+                        transport_problems.extend(recovered.problems)
+        # Ambiguous transport is never valid. Use its first coherent branch only
+        # to retain available identity/answer claims, alongside a durable gap.
+        while isinstance(value, dict) and set(value) == {"answer_sources"}:
+            value = value["answer_sources"][0]
+        return value
+
+    whole = envelope(text)
     if isinstance(whole, dict) and ("status" in whole or "event" not in whole):
         result = whole
         parsed["root_session_id"] = result.get("session_id") or result.get("conversation_id")
         parsed["actual_model"] = result.get("model")
+        children = result.get("child_session_ids")
+        if isinstance(children, list):
+            parsed["child_session_ids"] = list(dict.fromkeys(
+                c for c in children if isinstance(c, str) and c and c != parsed["root_session_id"]))
     else:
+        agy_transport = True
         if isinstance(whole, dict):
             events.append(whole)
         for line in ([] if isinstance(whole, dict) else text.splitlines()):
             if not line.strip():
                 continue
             try:
-                event = json.loads(line)
+                event = envelope(line, is_line=True)
             except ValueError:
                 parsed["parse_warnings"] += 1
                 continue
@@ -104,6 +176,13 @@ def _parse_output(text: str, structured: bool) -> dict:
         root = parsed["root_session_id"]
         candidates = [value for value in candidates if isinstance(value, dict)
                       and (not root or value.get("conversation_id") in {None, root})]
+        if len(candidates) > 1:
+            transport_problems.append("Multiple terminal root results require reconciliation")
+            transport_sources.append(source_record(text, "multiple-root-results"))
+            for candidate in candidates:
+                recovered = review_channels(candidate, True)
+                if recovered.answer is not None:
+                    transport_answers.append(recovered.answer)
         result = candidates[-1] if candidates else {}
         parsed["root_session_id"] = root or result.get("conversation_id")
         for event in events:
@@ -114,22 +193,57 @@ def _parse_output(text: str, structured: bool) -> dict:
                         parsed["child_session_ids"].append(identity)
         parsed["actual_model"] = parsed["actual_model"] or result.get("model")
     parsed["provider_status"] = result.get("status")
+    parsed["provider_error"] = result.get("error")
     parsed["usage"] = result.get("usage")
     parsed["raw_response"] = result.get("response")
-    if "structured_output" in result and result["structured_output"] is not None:
-        parsed["response"] = result["structured_output"]
+    if structured:
+        reviewed = review_channels(result, agy_transport)
+        reviewed.problems.extend(transport_problems)
+        reviewed.sources.extend(transport_sources)
+        if transport_answers:
+            reviewed.answer = [reviewed.answer, *transport_answers]
+        if any(".conversation_id" in p or ".session_id" in p for p in transport_problems):
+            parsed["root_session_id"] = None
+        if any(".model" in p for p in transport_problems):
+            parsed["actual_model"] = None
+        parsed["response"] = reviewed.answer
+        parsed["ingestion"] = reviewed.metadata()
     else:
-        response = result.get("response")
-        if structured and isinstance(response, str):
-            try:
-                response = json.loads(response)
-            except ValueError:
-                response = None
-        parsed["response"] = response
+        parsed["response"] = result.get("structured_output", result.get("response"))
     parsed["valid"] = (parsed["provider_status"] == "SUCCESS" and parsed["response"] is not None)
-    if structured and not isinstance(parsed["response"], (dict, list)):
+    if structured and (not isinstance(parsed["response"], (dict, list))
+                       or parsed["ingestion"]["problems"]):
         parsed["valid"] = False
     return parsed
+
+
+def _wait_for_result(process: subprocess.Popen, stdout: Path, timeout: float, grace: float, structured: bool, max_bytes=1_048_576) -> bool:
+    """Wait for exit; True when a valid root result was written but the process outlived the grace.
+
+    Raises subprocess.TimeoutExpired when neither happens within timeout.
+    """
+    deadline = time.monotonic() + timeout
+    settled = None
+    while True:
+        now = time.monotonic()
+        stderr=stdout.parent/'stderr.txt'
+        if stdout.stat().st_size + (stderr.stat().st_size if stderr.exists() else 0) > max_bytes:
+            raise ValueError("Response byte limit exceeded")
+        if now >= deadline:
+            raise subprocess.TimeoutExpired(process.args, timeout)
+        try:
+            process.wait(timeout=min(1.0, deadline - now))
+            return False
+        except subprocess.TimeoutExpired:
+            pass
+        if settled is None:
+            try:
+                if _parse_output(stdout.read_text(encoding="utf-8", errors="strict"), structured)["valid"]:
+                    settled = time.monotonic()
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+        elif time.monotonic() - settled >= grace:
+            return True
 
 
 def _contain(process: subprocess.Popen):
@@ -261,6 +375,10 @@ def execute_role(project_root, role, prompt, config, evidence_dir, response_sche
     try:
         if not isinstance(config, dict):
             raise ValueError("Role configuration must be an object")
+        from .capabilities import capabilities
+        profile = capabilities(config)
+        receipt["capabilities"] = profile
+        structured = response_schema is not None
         if role not in DEFAULT_TIMEOUTS:
             raise ValueError("Role must be builder, reviewer or repair")
         if not project.is_dir() or not isinstance(prompt, str) or not prompt.strip():
@@ -269,6 +387,9 @@ def execute_role(project_root, role, prompt, config, evidence_dir, response_sche
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Timeout must be a finite positive number of seconds")
         receipt["timeout_seconds"] = timeout
+        grace = config.get("result_grace", 30)
+        if isinstance(grace, bool) or not isinstance(grace, (int, float)) or not math.isfinite(grace) or grace < 0:
+            raise ValueError("result_grace must be a finite non-negative number of seconds")
         (attempt / "prompt.md").write_text(prompt, encoding="utf-8")
         schema_file = attempt / "response-schema.json"
         if response_schema is not None:
@@ -277,9 +398,11 @@ def execute_role(project_root, role, prompt, config, evidence_dir, response_sche
             _write_json(schema_file, response_schema)
             receipt["artifacts"]["schema"] = str(schema_file)
         paths = {"project": str(project), "prompt_file": str(attempt / "prompt.md"),
-                 "schema_file": str(schema_file) if response_schema is not None else "",
+                 "schema_file": str(schema_file) if response_schema is not None and profile["response_mode"] == "native-schema" else "",
                  "scratch": (environment or {}).get("MATLAB_HARNESS_SCRATCH", "")}
-        arguments = _arguments(config, prompt, paths, response_schema)
+        arguments = _arguments(config, prompt, paths, response_schema if profile["response_mode"] == "native-schema" else None)
+        if os.name == "nt" and Path(arguments[0]).suffix.lower() in {".bat", ".cmd"}:
+            raise ValueError("Windows batch launchers are unsupported; configure the executable directly")
         # Retain the exact argv in private project evidence, not public telemetry.
         receipt["argv"] = arguments
         with (attempt / "stdout.txt").open("wb") as stdout, (attempt / "stderr.txt").open("wb") as stderr:
@@ -291,25 +414,41 @@ def execute_role(project_root, role, prompt, config, evidence_dir, response_sche
             receipt["pid"] = process.pid
             _write_json(receipt_path, receipt)
             try:
-                process.wait(timeout=timeout)
-                receipt["status"] = "SUCCEEDED" if process.returncode == 0 else "FAILED"
+                if _wait_for_result(process, attempt / "stdout.txt", timeout, grace, structured, profile["max_response_bytes"]):
+                    # The root result is final; a CLI that lingers after it only burns the budget.
+                    receipt["stopped_after_result"] = True
+                    receipt["cleanup"] = _stop_owned_process(process)
+                    receipt["status"] = "SUCCEEDED"
+                else:
+                    receipt["status"] = "SUCCEEDED" if process.returncode == 0 else "FAILED"
             except subprocess.TimeoutExpired:
                 receipt["status"] = "TIMED_OUT"
                 receipt["cleanup"] = _stop_owned_process(process)
             except KeyboardInterrupt:
                 receipt["status"] = "INTERRUPTED"
                 receipt["cleanup"] = _stop_owned_process(process)
+            except ValueError as exc:
+                receipt["status"] = "MALFORMED"
+                receipt["parse_error"] = str(exc)
+                receipt["cleanup"] = _stop_owned_process(process)
             receipt["cleanup"].update(_release(process, job))
         receipt["exit_code"] = process.poll()
-        output = (attempt / "stdout.txt").read_text(encoding="utf-8", errors="replace")
         try:
-            parsed = _parse_output(output, response_schema is not None)
+            if sum((attempt/name).stat().st_size for name in ("stdout.txt","stderr.txt")) > profile["max_response_bytes"]:
+                raise ValueError("Response byte limit exceeded; complete source retained on disk")
+            output = (attempt / "stdout.txt").read_text(encoding="utf-8", errors="strict")
+            parsed = _parse_output(output, structured)
             valid = parsed.pop("valid")
             receipt.update(parsed)
             if receipt["status"] == "SUCCEEDED" and not valid:
                 receipt["status"] = "FAILED" if parsed["provider_status"] not in {None, "SUCCESS"} else "MALFORMED"
         except (ValueError, TypeError, AttributeError) as exc:
             receipt["parse_error"] = str(exc)
+            if structured:
+                from .decoding import file_source
+                receipt["ingestion"] = {"version": 1, "problems": ["Transport envelope could not be examined: " + str(exc)],
+                                        "sources": [file_source(attempt / "stdout.txt", "transport-error")],
+                                        "assurance": "raw-invalid-v1"}
             if receipt["status"] == "SUCCEEDED":
                 receipt["status"] = "MALFORMED"
     except ValueError as exc:
@@ -323,5 +462,6 @@ def execute_role(project_root, role, prompt, config, evidence_dir, response_sche
     finally:
         receipt["finished_at"] = _utc()
         receipt["wall_seconds"] = round(time.monotonic() - started, 6)
+        receipt["failure"] = classify_failure(receipt)
         _write_json(receipt_path, receipt)
     return receipt
